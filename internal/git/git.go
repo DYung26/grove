@@ -81,6 +81,19 @@ func WorktreeRemove(path string, force bool) error {
 	return err
 }
 
+// WorktreePrune runs `git worktree prune`, git's own cleanup for
+// worktree administrative state (the entry under .git/worktrees/) whose
+// directory no longer exists on disk at all. This is the correct
+// git-side step after something outside git's knowledge removed a
+// worktree's directory directly — e.g. pool.DeleteSubvolume deleting a
+// corrupted worktree's backing subvolume — since WorktreeRemove itself
+// requires a live, readable directory to validate against and can't be
+// used for a directory that's already gone.
+func WorktreePrune() error {
+	_, err := run("worktree", "prune")
+	return err
+}
+
 // WorktreeMove relocates a worktree's directory via `git worktree move`,
 // updating git's own worktree administrative files so the branch stays
 // correctly linked at its new path.

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 
 	"github.com/dyung/grove/internal/config"
+	"github.com/dyung/grove/internal/fs"
 	"github.com/dyung/grove/internal/git"
 	"github.com/dyung/grove/internal/output"
 	"github.com/spf13/cobra"
@@ -16,7 +17,7 @@ var openPrint bool
 var openCmd = &cobra.Command{
 	Use:   "open <name-or-branch>",
 	Short: "Open any worktree by its Grove name or git branch (including the main repo)",
-	Args:  cobra.ExactArgs(1),
+	Args:  exactArgs(1),
 	RunE:  runOpen,
 }
 
@@ -60,8 +61,8 @@ func resolveOpenPath(nameOrBranch string) (string, error) {
 	}
 
 	if wt, found := reg.Find(nameOrBranch); found {
-		if _, err := os.Stat(wt.Path); err != nil {
-			return "", fmt.Errorf("worktree %q is tracked but its directory is missing: %w", nameOrBranch, err)
+		if err := requireHealthyWorktree(wt.Path, nameOrBranch); err != nil {
+			return "", err
 		}
 		return wt.Path, nil
 	}
@@ -75,12 +76,27 @@ func resolveOpenPath(nameOrBranch string) (string, error) {
 		if wt.Branch != nameOrBranch {
 			continue
 		}
-		if _, err := os.Stat(wt.Path); err != nil {
-			return "", fmt.Errorf("branch %q is checked out at %s, but that directory is missing: %w", nameOrBranch, wt.Path, err)
+		if status := fs.CheckHealth(wt.Path); status != fs.Healthy {
+			return "", fmt.Errorf("branch %q is checked out at %s, but that directory is %s", nameOrBranch, wt.Path, status)
 		}
 		return wt.Path, nil
 	}
 	return "", fmt.Errorf("no worktree tracked or checked out as %q (see `grove list` or `git worktree list`)", nameOrBranch)
+}
+
+// requireHealthyWorktree checks a registry-tracked worktree's directory
+// with a real health probe rather than a plain os.Stat, so a path that
+// exists but is corrupted (EIO from a broken btrfs subvolume, a mount
+// that flipped read-only) gets a diagnosis naming what's actually wrong
+// instead of either a raw stat error or, worse, being treated as fine
+// because the stat itself succeeded. Shared by every command that looks
+// a worktree up by registry entry before acting on its directory.
+func requireHealthyWorktree(path, name string) error {
+	status := fs.CheckHealth(path)
+	if status == fs.Healthy {
+		return nil
+	}
+	return fmt.Errorf("worktree %q is tracked but its directory is %s", name, status)
 }
 
 // spawnSubshell drops the user into an interactive shell rooted at path.

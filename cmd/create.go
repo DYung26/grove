@@ -32,7 +32,12 @@ var builtinDependencyDirsByType = map[project.Type][]string{
 	// dependency_dirs in .grove.json.
 	project.PNPM:   {},
 	project.Cargo:  {"target"},
-	project.Python: {".venv"},
+	// Both .venv and venv are checked: .venv is the more common modern
+	// convention (and what tools like `python -m venv .venv` and poetry
+	// default to), but plain venv is still common enough in older or
+	// hand-rolled setups that skipping it would silently miss a real
+	// project's dependency dir.
+	project.Python: {".venv", "venv"},
 	// Go intentionally clones nothing by default: the module cache lives
 	// outside the repo (GOPATH/pkg/mod, shared across all worktrees
 	// already), and there's no vendor dir unless the project explicitly
@@ -40,10 +45,43 @@ var builtinDependencyDirsByType = map[project.Type][]string{
 	project.Go: {},
 }
 
+// dependencyDirAlternates lists, per project type, groups of built-in
+// dirs where only one member is ever expected to exist at once (e.g.
+// .venv vs venv — the same logical dependency dir under two naming
+// conventions). This is deliberately separate from
+// builtinDependencyDirsByType rather than folded into a richer element
+// type there: ResolveDependencyDirs and every existing caller of
+// builtinDependencyDirsByType still take a flat []string, and project
+// config's DependencyDirs/ExcludeDependencyDirs entries are individual
+// dirs a user opted into or out of by name, never alternates of each
+// other, so there's no case where they'd need a slot of their own here.
+// Only reportDependencyDirsFound consults this, to decide whether a
+// missing dir is a genuine gap worth a warning or just the sibling of a
+// convention that already matched.
+var dependencyDirAlternates = map[project.Type][][]string{
+	project.Python: {{".venv", "venv"}},
+}
+
+// alternateGroupFor reports the alternates group projectType's dir
+// belongs to, if any, so reportDependencyDirsFound can check whether a
+// sibling in the same group was found. ok is false for dirs with no
+// group — every built-in dir outside dependencyDirAlternates, plus
+// anything added via .grove.json's dependency_dirs.
+func alternateGroupFor(projectType project.Type, dir string) (group []string, ok bool) {
+	for _, g := range dependencyDirAlternates[projectType] {
+		for _, d := range g {
+			if d == dir {
+				return g, true
+			}
+		}
+	}
+	return nil, false
+}
+
 var createCmd = &cobra.Command{
 	Use:   "create <branch>",
 	Short: "Create a new worktree for a branch",
-	Args:  cobra.ExactArgs(1),
+	Args:  exactArgs(1),
 	RunE:  runCreate,
 }
 
@@ -87,6 +125,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	worktreePath := filepath.Join(worktreesDir, name)
+	if err := requireFreeWorktreePath(worktreePath, name); err != nil {
+		return err
+	}
+
 	if newBranch {
 		err = git.WorktreeAddNewBranch(worktreePath, branch)
 	} else {
@@ -123,6 +165,40 @@ func runCreate(cmd *cobra.Command, args []string) error {
 // Branch are shown even when they're the same string right now.
 func describeCreated(name, branch, worktreePath string) string {
 	return fmt.Sprintf("%s Created worktree %s (branch %s) at %s", output.Success("✓"), output.Name(name), branch, output.Path(worktreePath))
+}
+
+// requireFreeWorktreePath checks worktreePath before `git worktree add`
+// ever touches it, so a collision gets a clear, specific diagnosis
+// instead of git's own raw stderr ("already exists", with no indication
+// of what's actually there or why). Uses os.Lstat rather than os.Stat
+// deliberately: a dangling symlink — e.g. left behind by a pool
+// migration whose subvolume was later deleted or recreated, orphaning
+// the symlink that used to point at it — still occupies that directory
+// entry as far as `git worktree add` is concerned (it refuses with
+// "already exists" the same as it would for a real directory), but
+// os.Stat follows the link and would report a plain ENOENT, identical
+// to the path genuinely being free. Lstat sees the entry regardless of
+// whether its target resolves, which is what actually matters here.
+func requireFreeWorktreePath(worktreePath, name string) error {
+	info, err := os.Lstat(worktreePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		if _, statErr := os.Stat(worktreePath); os.IsNotExist(statErr) {
+			return fmt.Errorf("%s exists but is a broken symlink (its target is gone — possibly an orphaned pool migration; see %s) — remove it before creating %q here: %s",
+				output.Path(worktreePath), output.Command("grove pool status"), name, output.Commandf("rm %s", worktreePath))
+		}
+		return fmt.Errorf("%s already exists (a symlink, possibly pool-resident) — remove it or choose a different %s before creating %q here",
+			output.Path(worktreePath), output.Command("--name"), name)
+	}
+
+	return fmt.Errorf("%s already exists on disk but isn't a tracked worktree (see %s) — remove it manually or choose a different %s before creating %q here",
+		output.Path(worktreePath), output.Command("grove list"), output.Command("--name"), name)
 }
 
 // resolveWorktreeName picks the stable identifier Grove uses for this
@@ -258,13 +334,17 @@ func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error)
 	// `grove create` run rather than once per dir.
 	fallback := fallbackUndecided
 	worstMode := fs.CloneModeReflink
+	found := make([]string, 0, len(dirs))
+	missing := make([]string, 0, len(dirs))
 	any := false
 
 	for _, dir := range dirs {
 		src := filepath.Join(srcRoot, dir)
 		if _, err := os.Stat(src); os.IsNotExist(err) {
+			missing = append(missing, dir)
 			continue
 		}
+		found = append(found, dir)
 
 		dst := filepath.Join(worktreePath, dir)
 		mode, skipped, err := cloneOneDependencyDir(src, dst, &fallback)
@@ -280,11 +360,53 @@ func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error)
 		}
 	}
 
+	reportDependencyDirsFound(srcRoot, projectType, found, missing)
 	if !any {
 		return "", nil
 	}
 	reportCloneMode(worstMode)
 	return worstMode.String(), nil
+}
+
+// reportDependencyDirsFound tells the user which of the resolved
+// dependency dirs actually existed at srcRoot and were cloned, and which
+// were expected but genuinely missing — silently skipping a missing dir
+// looks identical to Grove having succeeded with nothing to clone, which
+// hides cases like a main repo that's lost its own .venv.
+//
+// A dir in missing is only reported when it isn't just the unmatched
+// sibling of an alternates group (see dependencyDirAlternates) where
+// another member was already found: e.g. once venv has been found for a
+// Python project, .venv being absent is expected, not a gap, so it's
+// filtered out here rather than printed alongside genuine misses.
+func reportDependencyDirsFound(srcRoot string, projectType project.Type, found, missing []string) {
+	if len(found) > 0 {
+		fmt.Println(output.Dim(fmt.Sprintf("Found %s in %s.", strings.Join(found, ", "), output.Path(srcRoot))))
+	}
+
+	genuinelyMissing := make([]string, 0, len(missing))
+	for _, dir := range missing {
+		group, ok := alternateGroupFor(projectType, dir)
+		if ok && groupHasMatch(group, found) {
+			continue
+		}
+		genuinelyMissing = append(genuinelyMissing, dir)
+	}
+	if len(genuinelyMissing) > 0 {
+		fmt.Println(output.Warn(fmt.Sprintf("Not found in %s, nothing to clone: %s.", output.Path(srcRoot), strings.Join(genuinelyMissing, ", "))))
+	}
+}
+
+// groupHasMatch reports whether any member of group is present in found.
+func groupHasMatch(group, found []string) bool {
+	for _, f := range found {
+		for _, g := range group {
+			if f == g {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // resolveDepsSourceRoot turns the --from flag's value into an absolute
@@ -360,8 +482,12 @@ func ensureDepsSourcePoolResident(repoRoot, worktreeLabel, srcRoot string) error
 			continue
 		}
 
-		if _, err := pool.EnsureDependencyDirVolume(paths.MountPoint, repoName, worktreeLabel, srcRoot, dir); err != nil {
+		_, backup, err := pool.EnsureDependencyDirVolume(paths.MountPoint, repoName, worktreeLabel, srcRoot, dir)
+		if err != nil {
 			return fmt.Errorf("move %s into the pool: %w", dir, err)
+		}
+		if err := recordBackupIfAny(repoRoot, backup, "pool-migrate"); err != nil {
+			return err
 		}
 	}
 	return nil

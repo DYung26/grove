@@ -14,22 +14,8 @@ import (
 var renameCmd = &cobra.Command{
 	Use:   "rename <old-name> <new-name>",
 	Short: "Rename a tracked worktree, moving its directory and updating the registry",
-	Args:  validateRenameArgs,
+	Args:  exactArgs(2),
 	RunE:  runRename,
-}
-
-// validateRenameArgs replaces Cobra's bare "accepts 2 arg(s), received N"
-// with a message that actually shows the expected shape — old-name and
-// new-name are easy to conflate with each other or with the worktree's
-// branch, so a wrong-arity call is worth explaining rather than just
-// counting. cobra.ExactArgs(2) can't be chained ahead of this via
-// cobra.MatchAll: MatchAll stops at the first validator that errors, so
-// ExactArgs's own generic message would always win before this ever ran.
-func validateRenameArgs(cmd *cobra.Command, args []string) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: %s (see `grove list` for tracked worktree names)", cmd.Use)
-	}
-	return nil
 }
 
 func init() {

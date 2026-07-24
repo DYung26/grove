@@ -44,12 +44,12 @@ func requireSafeVolumeLabel(label string) error {
 // A pre-existing real directory at depRelPath is migrated into the
 // subvolume rather than discarded, exactly like EnsureWorktreeVolume does
 // for a worktree's own container directory.
-func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot, depRelPath string) (string, error) {
+func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot, depRelPath string) (path, backupPath string, err error) {
 	if err := requireSafeVolumeLabel(repoName); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := requireSafeVolumeLabel(worktreeLabel); err != nil {
-		return "", err
+		return "", "", err
 	}
 	volumeName := fmt.Sprintf("%s-%s-%s", repoName, worktreeLabel, filepath.Base(depRelPath))
 	sibling := filepath.Join(worktreeRoot, depRelPath)
@@ -58,13 +58,14 @@ func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot
 	info, err := os.Lstat(sibling)
 	switch {
 	case os.IsNotExist(err):
-		return sibling, createSubvolume(subvolume, sibling)
+		return sibling, "", createSubvolume(subvolume, sibling)
 	case err != nil:
-		return sibling, err
+		return sibling, "", err
 	case info.Mode()&os.ModeSymlink != 0:
-		return sibling, nil
+		return sibling, "", nil
 	default:
-		return sibling, migrateIntoSubvolume(subvolume, sibling)
+		backup, err := migrateIntoSubvolume(subvolume, sibling)
+		return sibling, backup, err
 	}
 }
 
@@ -80,12 +81,12 @@ func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot
 // repoName and worktreeLabel key the subvolume name the same way
 // EnsureDependencyDirVolume does, and a pre-existing real directory at
 // worktreePath is migrated in rather than discarded, same as there.
-func EnsureWorktreeVolume(mountPoint, repoName, worktreeLabel, worktreePath string) (string, error) {
+func EnsureWorktreeVolume(mountPoint, repoName, worktreeLabel, worktreePath string) (path, backupPath string, err error) {
 	if err := requireSafeVolumeLabel(repoName); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := requireSafeVolumeLabel(worktreeLabel); err != nil {
-		return "", err
+		return "", "", err
 	}
 	volumeName := fmt.Sprintf("%s-%s", repoName, worktreeLabel)
 	subvolume := filepath.Join(mountPoint, volumeName)
@@ -93,13 +94,14 @@ func EnsureWorktreeVolume(mountPoint, repoName, worktreeLabel, worktreePath stri
 	info, err := os.Lstat(worktreePath)
 	switch {
 	case os.IsNotExist(err):
-		return worktreePath, createSubvolume(subvolume, worktreePath)
+		return worktreePath, "", createSubvolume(subvolume, worktreePath)
 	case err != nil:
-		return worktreePath, err
+		return worktreePath, "", err
 	case info.Mode()&os.ModeSymlink != 0:
-		return worktreePath, nil
+		return worktreePath, "", nil
 	default:
-		return worktreePath, migrateIntoSubvolume(subvolume, worktreePath)
+		backup, err := migrateIntoSubvolume(subvolume, worktreePath)
+		return worktreePath, backup, err
 	}
 }
 
@@ -119,38 +121,40 @@ func EnsureWorktreeVolume(mountPoint, repoName, worktreeLabel, worktreePath stri
 // back as a plain directory instead — it was never CoW-managed by Grove
 // and doesn't need a subvolume of its own.
 //
-// The original container subvolume is renamed to <repo>.wt.bak inside
-// the pool rather than deleted, so a failed or partial migration leaves
-// recoverable data; each entry inside it is rsync'd into its destination
-// rather than moved, since a subvolume can't be created around an
-// existing directory in place.
-func SplitRepoVolume(mountPoint, repoRoot string, trackedNames []string) (migrated bool, err error) {
+// The original container subvolume is renamed to <repo>.wt.grove-bak
+// inside the pool rather than deleted, so a failed or partial migration
+// leaves recoverable data; each entry inside it is rsync'd into its
+// destination rather than moved, since a subvolume can't be created
+// around an existing directory in place. The backup's path is returned
+// alongside migrated so the caller can record it in the registry for
+// `grove cleanup`/`grove status`.
+func SplitRepoVolume(mountPoint, repoRoot string, trackedNames []string) (migrated bool, backupPath string, err error) {
 	repoName := filepath.Base(repoRoot)
 	container := filepath.Join(filepath.Dir(repoRoot), repoName+".wt")
 
 	info, err := os.Lstat(container)
 	if os.IsNotExist(err) {
-		return false, nil
+		return false, "", nil
 	}
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		return false, nil
+		return false, "", nil
 	}
 
 	oldSubvolume, err := filepath.EvalSymlinks(container)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	entries, err := os.ReadDir(oldSubvolume)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	if err := ensureCommand("rsync", "rsync", nil); err != nil {
-		return false, fmt.Errorf("install rsync: %w", err)
+		return false, "", fmt.Errorf("install rsync: %w", err)
 	}
 
 	tracked := make(map[string]bool, len(trackedNames))
@@ -159,10 +163,10 @@ func SplitRepoVolume(mountPoint, repoRoot string, trackedNames []string) (migrat
 	}
 
 	if err := os.Remove(container); err != nil {
-		return false, err
+		return false, "", err
 	}
 	if err := os.MkdirAll(container, 0o755); err != nil {
-		return false, err
+		return false, "", err
 	}
 
 	for _, entry := range entries {
@@ -176,39 +180,39 @@ func SplitRepoVolume(mountPoint, repoRoot string, trackedNames []string) (migrat
 
 		if !tracked[name] {
 			if err := os.MkdirAll(dst, 0o755); err != nil {
-				return false, err
+				return false, "", err
 			}
 			if err := runLocal("rsync", "-a", src+"/", dst+"/"); err != nil {
-				return false, fmt.Errorf("copy %s into %s: %w", src, dst, err)
+				return false, "", fmt.Errorf("copy %s into %s: %w", src, dst, err)
 			}
 			continue
 		}
 
 		if err := requireSafeVolumeLabel(name); err != nil {
-			return false, err
+			return false, "", err
 		}
 
 		volumeName := fmt.Sprintf("%s-%s", repoName, name)
 		newSubvolume := filepath.Join(mountPoint, volumeName)
 
 		if err := runLocal("btrfs", "subvolume", "create", newSubvolume); err != nil {
-			return false, err
+			return false, "", err
 		}
 		if err := runLocal("rsync", "-a", src+"/", newSubvolume+"/"); err != nil {
-			return false, fmt.Errorf("copy %s into %s: %w", src, newSubvolume, err)
+			return false, "", fmt.Errorf("copy %s into %s: %w", src, newSubvolume, err)
 		}
 		if err := os.Symlink(newSubvolume, dst); err != nil {
-			return false, err
+			return false, "", err
 		}
 	}
 
-	backup := oldSubvolume + ".bak"
+	backup := oldSubvolume + ".grove-bak"
 	if err := os.Rename(oldSubvolume, backup); err != nil {
-		return false, err
+		return false, "", err
 	}
 
-	fmt.Println(output.Dim(fmt.Sprintf("Migrated %s into per-worktree subvolumes; original container kept at %s (delete once verified)", output.Path(container), output.Path(backup))))
-	return true, nil
+	fmt.Println(output.Dim(fmt.Sprintf("Migrated %s into per-worktree subvolumes; original container kept at %s (run `grove cleanup` once verified)", output.Path(container), output.Path(backup))))
+	return true, backup, nil
 }
 
 func createSubvolume(subvolume, sibling string) error {
@@ -218,29 +222,29 @@ func createSubvolume(subvolume, sibling string) error {
 	return os.Symlink(subvolume, sibling)
 }
 
-func migrateIntoSubvolume(subvolume, sibling string) error {
+func migrateIntoSubvolume(subvolume, sibling string) (string, error) {
 	if err := runLocal("btrfs", "subvolume", "create", subvolume); err != nil {
-		return err
+		return "", err
 	}
 
 	if err := ensureCommand("rsync", "rsync", nil); err != nil {
-		return fmt.Errorf("install rsync: %w", err)
+		return "", fmt.Errorf("install rsync: %w", err)
 	}
 
 	if err := runLocal("rsync", "-a", sibling+"/", subvolume+"/"); err != nil {
-		return fmt.Errorf("copy existing %s into pool: %w", sibling, err)
+		return "", fmt.Errorf("copy existing %s into pool: %w", sibling, err)
 	}
 
-	backup := sibling + ".bak"
+	backup := sibling + ".grove-bak"
 	if err := os.Rename(sibling, backup); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Symlink(subvolume, sibling); err != nil {
-		return err
+		return "", err
 	}
 
-	fmt.Println(output.Dim(fmt.Sprintf("Migrated existing %s into the pool; original kept at %s (delete once verified)", output.Path(sibling), output.Path(backup))))
-	return nil
+	fmt.Println(output.Dim(fmt.Sprintf("Migrated existing %s into the pool; original kept at %s (run `grove cleanup` once verified)", output.Path(sibling), output.Path(backup))))
+	return backup, nil
 }
 
 func runLocal(name string, args ...string) error {
@@ -248,4 +252,35 @@ func runLocal(name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// DeleteSubvolume removes the single Btrfs subvolume backing linkPath
+// (a pool-resident worktree directory or dependency dir, always a
+// symlink into the pool per EnsureWorktreeVolume/
+// EnsureDependencyDirVolume) and the now-dangling symlink itself. This
+// is the narrow, single-subvolume fix for a corrupted worktree —
+// distinct from Recreate, which wipes the entire pool. It only ever
+// touches the one subvolume linkPath resolves to; every other worktree
+// and dependency dir in the pool is untouched.
+//
+// linkPath must already resolve to a path inside the pool; the caller
+// is responsible for having confirmed that (see requireHealthyWorktree's
+// callers in cmd/) and for getting the user's confirmation before
+// calling this, since it permanently discards that worktree's contents
+// — acceptable only because everything reflinked into the pool is a
+// disposable clone of data that still exists in git or in the original
+// dependency-dir source.
+func DeleteSubvolume(linkPath, mountPoint string) error {
+	subvolume, err := filepath.EvalSymlinks(linkPath)
+	if err != nil {
+		return fmt.Errorf("resolve %s to its pool subvolume: %w", linkPath, err)
+	}
+	if !strings.HasPrefix(subvolume, mountPoint) {
+		return fmt.Errorf("%s resolves to %s, which isn't inside the pool at %s — refusing to delete it as a subvolume", linkPath, subvolume, mountPoint)
+	}
+
+	if err := runLocal("btrfs", "subvolume", "delete", subvolume); err != nil {
+		return fmt.Errorf("delete subvolume %s: %w", subvolume, err)
+	}
+	return os.Remove(linkPath)
 }

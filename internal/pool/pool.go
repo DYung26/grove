@@ -5,12 +5,14 @@ package pool
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/dyung/grove/internal/output"
 	"golang.org/x/sys/unix"
@@ -60,12 +62,68 @@ func IsMounted(mountPoint string) (bool, error) {
 	return false, scanner.Err()
 }
 
+// IsReadOnly reports whether mountPoint is currently mounted read-only.
+// Btrfs force-remounts a filesystem read-only, on its own, when it hits
+// metadata corruption it can't safely continue writing past — this is
+// what distinguishes "the pool itself has stopped accepting writes,
+// nothing inside it can be created or deleted" from "one subvolume is
+// unreadable but the pool otherwise still works fine", the two failure
+// modes that need genuinely different fixes. Parses /proc/mounts
+// directly, the same as IsMounted, rather than shelling out to `mount`.
+func IsReadOnly(mountPoint string) (bool, error) {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 4 || fields[1] != mountPoint {
+			continue
+		}
+		for _, opt := range strings.Split(fields[3], ",") {
+			if opt == "ro" {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return false, fmt.Errorf("%s is not currently mounted", mountPoint)
+}
+
+// existingLoopDevices returns every /dev/loopN currently attached to image, via `losetup -j` (list, filtered to one backing file). This can legitimately return more than one entry: nothing in the kernel stops two independent loop devices from attaching to the same backing file, which normally only happens when a prior mount was torn down uncleanly (crash, forced unmount after an I/O error, a boot where the nofail fstab entry raced something) and left a loop device dangling without ever being detached. Init uses this to reuse a live attachment instead of blindly creating a new one, and to warn if it finds more than one already.
+func existingLoopDevices(image string) ([]string, error) {
+	out, err := exec.Command("losetup", "-j", image).Output()
+	if err != nil {
+		// losetup -j exits 0 with empty output when nothing matches, so a real error here is a genuine failure to ask the question, not "no attachments found".
+		return nil, fmt.Errorf("losetup -j %s: %w", image, err)
+	}
+
+	var devices []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// Each line looks like "/dev/loop1: []: (/home/user/.grove/pool.img)".
+		device, _, found := strings.Cut(line, ":")
+		if found {
+			devices = append(devices, device)
+		}
+	}
+	return devices, nil
+}
+
 func Init(paths Paths, sizeGB uint64) error {
 	mounted, err := IsMounted(paths.MountPoint)
 	if err != nil {
 		return err
 	}
 	if mounted {
+		if err := warnIfMultiplyMounted(paths.Image, paths.MountPoint); err != nil {
+			return err
+		}
 		fmt.Printf("%s Pool already mounted at %s\n", output.Success("✓"), output.Path(paths.MountPoint))
 		return nil
 	}
@@ -100,7 +158,7 @@ func Init(paths Paths, sizeGB uint64) error {
 		return err
 	}
 
-	if err := runSudo("mount", "-o", "loop", paths.Image, paths.MountPoint); err != nil {
+	if err := mountImage(paths); err != nil {
 		return err
 	}
 
@@ -116,8 +174,160 @@ func Init(paths Paths, sizeGB uint64) error {
 	return nil
 }
 
+// mountImage mounts paths.Image at paths.MountPoint, first checking whether the image file is already attached to a loop device rather than letting a bare `mount -o loop` decide that on its own. mount -o loop normally reuses an existing attachment for the same file when there's exactly one, but that's a courtesy the kernel provides, not a guarantee Init can rely on — if a prior mount was ever torn down uncleanly and left a loop device dangling, or if two attachments already exist from an earlier bug, proceeding blindly risks ending up with two independent loop devices mounted over the same backing file at once, which two Btrfs instances writing through independently can corrupt. Checking first turns that silent risk into a visible, actionable one.
+func mountImage(paths Paths) error {
+	devices, err := existingLoopDevices(paths.Image)
+	if err != nil {
+		return err
+	}
+
+	switch len(devices) {
+	case 0:
+		return runSudo("mount", "-o", "loop", paths.Image, paths.MountPoint)
+	case 1:
+		// Already attached (e.g. left over from an unclean shutdown) but not mounted anywhere, since Init already confirmed paths.MountPoint itself isn't mounted before calling this. Mount that same device directly instead of asking for a fresh attachment.
+		fmt.Printf("%s %s is already attached to %s; mounting it directly instead of creating a new loop device.\n", output.Warn("Note:"), output.Path(paths.Image), devices[0])
+		return runSudo("mount", devices[0], paths.MountPoint)
+	default:
+		return fmt.Errorf("%s is attached to %d loop devices at once (%s); this shouldn't happen and risks Btrfs corruption if more than one gets mounted — detach the extras with `sudo losetup -d <device>` after confirming with `lsof <device>`/`fuser <device>` that nothing is using them, then re-run `grove pool init`", paths.Image, len(devices), strings.Join(devices, ", "))
+	}
+}
+
+// ListSubvolumes returns the name of every top-level subvolume
+// currently in the pool at mountPoint (e.g. "assessly-backend-main",
+// "assessly-backend-feat-x-node_modules"), via `btrfs subvolume list`.
+// This is a read-only extent-metadata query, same class of operation as
+// usage.go's btrfsExclusiveSize, and needs no root on most systems —
+// but some kernel/mount-option combinations restrict subvolume listing
+// to privileged users regardless, so a permission failure here is a
+// real, recoverable case, not a can't-happen one. Runs unprivileged
+// first and only escalates to sudo on a permission-shaped failure,
+// rather than always prompting for a password on a read-only status
+// check that usually doesn't need one.
+func ListSubvolumes(mountPoint string) ([]string, error) {
+	out, err := runBtrfsSubvolumeList(mountPoint, false)
+	if err != nil && isPermissionDenied(err) {
+		out, err = runBtrfsSubvolumeList(mountPoint, true)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var names []string
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		// Each line looks like: "ID 257 gen 12 top level 5 path assessly-backend-main".
+		// The subvolume's path is everything after the last " path ", which
+		// keeps this correct even if a subvolume name itself happened to
+		// contain the substring "path ".
+		line := scanner.Text()
+		idx := strings.LastIndex(line, " path ")
+		if idx == -1 {
+			continue
+		}
+		names = append(names, line[idx+len(" path "):])
+	}
+	return names, scanner.Err()
+}
+
+// runBtrfsSubvolumeList runs `btrfs subvolume list mountPoint`, via sudo
+// if asRoot is set, and returns stdout. On failure the error includes
+// stderr — exec.Cmd.Output() alone discards it, which previously turned
+// every real cause (most commonly "Permission denied", but also a
+// mountPoint that isn't actually btrfs, or btrfs-progs missing
+// mid-command) into an opaque "exit status 1" with no way to tell them
+// apart.
+func runBtrfsSubvolumeList(mountPoint string, asRoot bool) (string, error) {
+	var cmd *exec.Cmd
+	if asRoot {
+		cmd = exec.Command("sudo", "btrfs", "subvolume", "list", mountPoint)
+	} else {
+		cmd = exec.Command("btrfs", "subvolume", "list", mountPoint)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("btrfs subvolume list %s: %w: %s", mountPoint, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+// isPermissionDenied reports whether err (as returned by
+// runBtrfsSubvolumeList) looks like a permission failure rather than
+// some other cause (bad path, btrfs-progs missing, etc.) that retrying
+// with sudo wouldn't fix and would just prompt for a password
+// needlessly. Matches on the wrapped stderr text rather than an exit
+// code, since `btrfs subvolume list` doesn't document a distinct exit
+// status for this case. Checks both phrasings btrfs-progs actually
+// uses: a plain filesystem-permission failure surfaces as "Permission
+// denied", but the far more common case for this specific command —
+// confirmed live on this machine — is the tree-search ioctl itself
+// requiring CAP_SYS_ADMIN regardless of file permissions, which btrfs
+// reports as "ERROR: can't perform the search: Operation not
+// permitted" instead. Both need the same fix (retry as root), so both
+// are treated as the same case here.
+func isPermissionDenied(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "operation not permitted")
+}
+
 func ensureBtrfsProgs() error {
 	return ensureCommand("mkfs.btrfs", "btrfs-progs", map[string]string{"zypper": "btrfsprogs"})
+}
+
+// mountsOf returns every mountpoint currently mounted from any of the given devices, by scanning /proc/mounts once and matching device against fields[0]. Used to see where a pool image's loop devices are actually mounted — IsMounted alone only answers "is Grove's own expected mountpoint in use", which says nothing about a completely separate mountpoint (e.g. one set up by hand while testing, outside ~/.grove entirely) sharing the same backing file.
+func mountsOf(devices []string) (map[string]string, error) {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	wanted := make(map[string]bool, len(devices))
+	for _, d := range devices {
+		wanted[d] = true
+	}
+
+	mountpoints := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) > 1 && wanted[fields[0]] {
+			mountpoints[fields[0]] = fields[1]
+		}
+	}
+	return mountpoints, scanner.Err()
+}
+
+// warnIfMultiplyMounted checks whether image's backing loop devices are mounted at more than one place at once — the actually dangerous condition, as opposed to merely being *attached* more than once (existingLoopDevices/mountImage's own job). Called from Init's already-mounted fast path, since mountImage's attachment-count check only ever runs on the mount path: if paths.MountPoint is already mounted, Init returns before mountImage is ever reached, so without this a pool reported as "already mounted" could still have a second, completely separate mountpoint (e.g. one created by hand, outside ~/.grove entirely) silently writing through the same backing file. Confirmed live on this machine: a manually-created /mnt/grove-pool mount, set up once while testing and never torn down, sat alongside Grove's own ~/.grove/pool-mount indefinitely, actively corrupting the shared pool.img every time both were mounted — exactly the scenario this exists to catch. Doesn't attempt a fix; the right next step (which mount to keep, which fstab entry to remove) is a decision only the user can make safely.
+func warnIfMultiplyMounted(image, ownMountPoint string) error {
+	devices, err := existingLoopDevices(image)
+	if err != nil {
+		return err
+	}
+	if len(devices) <= 1 {
+		return nil
+	}
+
+	mountpoints, err := mountsOf(devices)
+	if err != nil {
+		return err
+	}
+	if len(mountpoints) <= 1 {
+		// More than one attachment, but at most one is actually mounted — the others are dangling, not actively dangerous. Worth a lighter note, not the same severity as a second live mount.
+		fmt.Printf("%s %s has %d loop attachments but only one is mounted; the rest are likely leftover from an unclean shutdown. Detach them with `sudo losetup -d <device>` once confirmed idle (`lsof <device>`/`fuser <device>`).\n", output.Warn("Note:"), output.Path(image), len(devices))
+		return nil
+	}
+
+	var others []string
+	for device, mountpoint := range mountpoints {
+		if mountpoint != ownMountPoint {
+			others = append(others, fmt.Sprintf("%s at %s", device, mountpoint))
+		}
+	}
+	return fmt.Errorf("%s is mounted at %d places at once (%s), in addition to %s — this actively corrupts the pool, since each mount writes through independently with no coordination. Unmount every location except the one you want to keep, remove its /etc/fstab entry so it doesn't come back, then re-run `grove pool init`", image, len(mountpoints), strings.Join(others, ", "), ownMountPoint)
 }
 
 // reclaimOwnershipIfNeeded chowns root (recursively) back to the current
@@ -147,6 +357,21 @@ func reclaimOwnershipIfNeeded(root string) error {
 	return runSudo("chown", "-R", owner, root)
 }
 
+// SizeExceedsLimitError reports that a requested pool size exceeds
+// maxUsableFraction of free space on the target filesystem. Callers in
+// the command layer type-assert for this specifically (rather than
+// matching on error text) so they can offer the user MaxGB as a
+// concrete, already-computed fallback instead of just failing.
+type SizeExceedsLimitError struct {
+	RequestedGB uint64
+	MaxGB       uint64
+	AvailableGB float64
+}
+
+func (e *SizeExceedsLimitError) Error() string {
+	return fmt.Sprintf("requested %dG exceeds %.0f%% of available space (%.1fG free); choose a smaller --size", e.RequestedGB, maxUsableFraction*100, e.AvailableGB)
+}
+
 func checkAvailableSpace(dir string, requestedBytes, sizeGB uint64) error {
 	var stat unix.Statfs_t
 	if err := unix.Statfs(dir, &stat); err != nil {
@@ -157,9 +382,36 @@ func checkAvailableSpace(dir string, requestedBytes, sizeGB uint64) error {
 	limit := float64(availableBytes) * maxUsableFraction
 	if float64(requestedBytes) > limit {
 		availableGB := float64(availableBytes) / (1 << 30)
-		return fmt.Errorf("requested %dG exceeds %.0f%% of available space (%.1fG free); choose a smaller --size", sizeGB, maxUsableFraction*100, availableGB)
+		return &SizeExceedsLimitError{
+			RequestedGB: sizeGB,
+			MaxGB:       maxUsableSizeGB(availableBytes),
+			AvailableGB: availableGB,
+		}
 	}
 	return nil
+}
+
+// maxUsableSizeGB converts availableBytes into the largest whole-GiB
+// pool size that still fits within maxUsableFraction of it, rounding
+// down so the suggested fallback never itself exceeds the limit it was
+// computed from.
+func maxUsableSizeGB(availableBytes uint64) uint64 {
+	limitGB := (float64(availableBytes) * maxUsableFraction) / (1 << 30)
+	return uint64(limitGB)
+}
+
+// MaxUsableSizeGB reports the largest whole-GiB pool size that currently
+// fits within maxUsableFraction of free space on dir's filesystem. Used
+// by the command layer to offer a concrete fallback size up front (e.g.
+// in `grove pool init`'s flag help), separately from the
+// SizeExceedsLimitError path that reports it after an actual attempt
+// fails.
+func MaxUsableSizeGB(dir string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(dir, &stat); err != nil {
+		return 0, err
+	}
+	return maxUsableSizeGB(stat.Bavail * uint64(stat.Bsize)), nil
 }
 
 func fileExists(path string) bool {
@@ -202,6 +454,146 @@ func runSudo(args ...string) error {
 	cmd := exec.Command("sudo", args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// RemountReadWrite attempts to remount an already-mounted pool
+// read-write, for the case where a transient issue (not ongoing
+// metadata corruption) tripped the read-only flag. This is deliberately
+// non-destructive and safe to attempt first: if the underlying
+// corruption is still present, btrfs will simply re-trip back to
+// read-only on the next write it can't complete, which the caller can
+// detect by checking IsReadOnly again rather than trusting this call's
+// own success — `mount -o remount,rw` succeeding only means the remount
+// syscall itself completed, not that the filesystem stayed writable.
+func RemountReadWrite(mountPoint string) error {
+	return runSudo("mount", "-o", "remount,rw", mountPoint)
+}
+
+// unmountForRecreate unmounts mountPoint for Recreate, tolerating the
+// specific failure mode a pool that has just force-remounted read-only
+// tends to produce: `umount` reporting the target busy even though no
+// process holds an open file or working directory under it (confirmed
+// separately via `fuser`/`lsof` showing only "kernel mount", no PIDs).
+// That combination means btrfs itself is still settling internally
+// right after the read-only trip, not that something external is really
+// using the mount — a plain umount can transiently fail here and
+// briefly retrying gives the kernel a moment to finish that before
+// escalating.
+//
+// If it's still busy after retrying, falls back to a lazy unmount
+// (`umount -l`): detaches the mountpoint from the namespace immediately
+// and lets the kernel finish tearing it down once truly idle, once any
+// last in-flight I/O (plausible here, since lsof already surfaced an I/O
+// error against one subvolume) drains. This is safe specifically because
+// Recreate's caller has already confirmed the destructive rebuild with
+// the user — a lazy unmount that appears to succeed immediately but
+// finishes async is exactly the right tradeoff once the decision to
+// discard the pool's contents has already been made, but not something
+// to reach for opportunistically elsewhere.
+func unmountForRecreate(mountPoint string) error {
+	const retries = 3
+	const retryDelay = 2 * time.Second
+
+	var lastErr error
+	for i := 0; i < retries; i++ {
+		if err := runSudo("umount", mountPoint); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(retryDelay)
+	}
+
+	fmt.Println(output.Warn("Plain unmount stayed busy after retrying; falling back to a lazy unmount (-l)."))
+	if err := runSudo("umount", "-l", mountPoint); err != nil {
+		return fmt.Errorf("plain unmount failed (%w) and lazy unmount also failed: %w", lastErr, err)
+	}
+	return nil
+}
+
+// Recreate destroys the pool image entirely and rebuilds it fresh at the
+// same paths — the actual fix once RemountReadWrite has been tried and
+// the pool immediately re-trips back to read-only, meaning the metadata
+// corruption btrfs detected isn't transient. This is the last resort,
+// not a repair: it wipes every worktree's reflinked dependency dirs and
+// pool-resident container currently in the pool, not just the one
+// subvolume that was originally found corrupted. That's an acceptable
+// cost only because everything the pool holds is, by Grove's own design,
+// a disposable CoW clone — the real data survives in git and in each
+// dependency dir's original source outside the pool. Callers (the
+// command layer) are responsible for confirming this with the user
+// first; Recreate itself performs no confirmation of its own.
+//
+// Unmounts via unmountForRecreate (tolerating a busy target, since a
+// read-only pool the user is trying to recover from may already be in a
+// half-torn-down state), removes the fstab entry so a stale reference
+// doesn't linger, deletes the image file, then reuses Init to rebuild it
+// from scratch at the same size.
+//
+// Safe to call again immediately after a failed attempt (e.g.
+// resolvePoolSize retrying with a smaller size once Init's space check
+// rejects the first): the teardown steps all become no-ops against
+// already-torn-down state (nothing mounted, no loop device attached, no
+// fstab entry, image file already removed) rather than re-failing, so
+// the retry lands directly on Init with nothing left to undo.
+func Recreate(paths Paths, sizeGB uint64) error {
+	if mounted, err := IsMounted(paths.MountPoint); err != nil {
+		return err
+	} else if mounted {
+		if err := unmountForRecreate(paths.MountPoint); err != nil {
+			return fmt.Errorf("unmount %s before recreating the pool: %w", paths.MountPoint, err)
+		}
+	}
+
+	if devices, err := existingLoopDevices(paths.Image); err == nil {
+		for _, device := range devices {
+			if err := runSudo("losetup", "-d", device); err != nil {
+				return fmt.Errorf("detach %s before recreating the pool: %w", device, err)
+			}
+		}
+	}
+
+	if err := removeFstabEntry(paths.MountPoint); err != nil {
+		return err
+	}
+
+	if err := os.Remove(paths.Image); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove old pool image %s: %w", paths.Image, err)
+	}
+
+	return Init(paths, sizeGB)
+}
+
+// removeFstabEntry strips any line referencing mountPoint from
+// /etc/fstab, the reverse of ensureFstabEntry, so Recreate doesn't leave
+// a dangling fstab entry pointing at an image file that no longer
+// exists — systemd would otherwise trip over that on the next boot
+// despite `nofail`, and ensureFstabEntry's own "does this line already
+// exist" check would then see the stale line and skip writing a fresh
+// one for the recreated image.
+func removeFstabEntry(mountPoint string) error {
+	data, err := os.ReadFile(fstabPath)
+	if err != nil {
+		return err
+	}
+
+	var kept []string
+	changed := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, mountPoint) {
+			changed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !changed {
+		return nil
+	}
+
+	cmd := exec.Command("sudo", "tee", fstabPath)
+	cmd.Stdin = strings.NewReader(strings.Join(kept, "\n"))
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }

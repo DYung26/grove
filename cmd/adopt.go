@@ -14,7 +14,7 @@ import (
 var adoptCmd = &cobra.Command{
 	Use:   "adopt <path>",
 	Short: "Register an existing git worktree that Grove didn't create",
-	Args:  cobra.ExactArgs(1),
+	Args:  exactArgs(1),
 	RunE:  runAdopt,
 }
 

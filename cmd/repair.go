@@ -21,12 +21,12 @@ var repairCmd = &cobra.Command{
 	Use:     "repair <name>",
 	Aliases: []string{"sync-deps"},
 	Short:   "Retrofit a worktree onto the pool (container and dependency dirs) so it can actually reflink",
-	Args:    cobra.ExactArgs(1),
+	Args:    exactArgs(1),
 	RunE:    runRepair,
 }
 
 func init() {
-	repairCmd.Flags().BoolVar(&repairForce, "force", false, "re-clone even if the registry already says deps are reflinked, and skip the .bak safety rename")
+	repairCmd.Flags().BoolVar(&repairForce, "force", false, "re-clone even if the registry already says deps are reflinked, and skip the .grove-bak safety rename")
 	repairCmd.Flags().StringVar(&repairFrom, "from", "", "clone dependency dirs from this worktree (name or path) instead of the main repo; migrates it into the pool first if needed so it can actually be reflinked from")
 	rootCmd.AddCommand(repairCmd)
 }
@@ -67,8 +67,8 @@ func runRepair(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if _, err := os.Stat(wt.Path); err != nil {
-		return fmt.Errorf("worktree %q is tracked but its directory is missing: %w", name, err)
+	if err := requireHealthyWorktree(wt.Path, name); err != nil {
+		return err
 	}
 
 	if err := ensureWorktreePoolResident(repoRoot, name, wt.Path); err != nil {
@@ -80,9 +80,14 @@ func runRepair(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	depsCloneMode, err := repairDependencyDirs(repoRoot, depsSrcRoot, wt.Path)
+	depsCloneMode, repaired, err := repairDependencyDirs(repoRoot, depsSrcRoot, wt.Path)
 	if err != nil {
 		return err
+	}
+
+	if !repaired {
+		fmt.Printf("%s %s's dependency dirs weren't found at the source; nothing was reflinked, registry left unchanged\n", output.Warn("!"), output.Name(name))
+		return nil
 	}
 
 	wt.DepsCloneMode = depsCloneMode
@@ -132,10 +137,11 @@ func ensureWorktreePoolResident(repoRoot, name, worktreePath string) error {
 	// it's already a symlink (i.e. already migrated), so no need to check
 	// that here first.
 	repoName := filepath.Base(repoRoot)
-	if _, err := pool.EnsureWorktreeVolume(paths.MountPoint, repoName, name, worktreePath); err != nil {
+	_, backup, err := pool.EnsureWorktreeVolume(paths.MountPoint, repoName, name, worktreePath)
+	if err != nil {
 		return fmt.Errorf("move worktree %s into the pool: %w", name, err)
 	}
-	return nil
+	return recordBackupIfAny(repoRoot, backup, "pool-migrate")
 }
 
 // repairDependencyDirs re-clones each resolved dependency dir from
@@ -144,36 +150,40 @@ func ensureWorktreePoolResident(repoRoot, name, worktreePath string) error {
 // split as cloneDependencyDirs in create.go, since that config is a
 // property of the main repo regardless of which worktree --from points
 // the clone source at. Existing dir contents are renamed to
-// <dir>.bak.old rather than deleted, refusing outright if a previous
-// .bak.old is still there unresolved; --force skips that and overwrites
+// <dir>.grove-bak rather than deleted, refusing outright if a previous
+// .grove-bak is still there unresolved; --force skips that and overwrites
 // in place.
-func repairDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error) {
+func repairDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, bool, error) {
 	projectCfg, err := config.LoadProjectConfig(repoRoot)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	projectType := project.Detect(repoRoot)
 	dirs := config.ResolveDependencyDirs(builtinDependencyDirsByType[projectType], projectCfg)
 	if len(dirs) == 0 {
 		explainNoDependencyDirs(projectType)
-		return config.DepsCloneModeNone, nil
+		return config.DepsCloneModeNone, true, nil
 	}
 
 	fallback := fallbackUndecided
 	worstMode := fs.CloneModeReflink
+	found := make([]string, 0, len(dirs))
+	missing := make([]string, 0, len(dirs))
 	any := false
 
 	for _, dir := range dirs {
 		src := filepath.Join(srcRoot, dir)
 		if _, err := os.Stat(src); os.IsNotExist(err) {
+			missing = append(missing, dir)
 			continue
 		}
+		found = append(found, dir)
 
 		dst := filepath.Join(worktreePath, dir)
-		mode, skipped, err := repairOneDependencyDir(src, dst, &fallback)
+		mode, skipped, err := repairOneDependencyDir(repoRoot, src, dst, &fallback)
 		if err != nil {
-			return "", explainCloneFailure(err, worktreePath)
+			return "", false, explainCloneFailure(err, worktreePath)
 		}
 		if skipped {
 			continue
@@ -184,24 +194,25 @@ func repairDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error
 		}
 	}
 
+	reportDependencyDirsFound(srcRoot, found, missing)
 	if !any {
-		return "", nil
+		return "", false, nil
 	}
 	reportCloneMode(worstMode)
-	return worstMode.String(), nil
+	return worstMode.String(), true, nil
 }
 
 // repairOneDependencyDir probes whether src can be reflinked before
 // touching dst at all, so a run that ends in the user picking [p] (pool
 // init) or aborting the prompt never backs dst up in the first place —
 // previously, backUpExistingDependencyDir ran unconditionally up front,
-// so a Ctrl-C at the h/c/s/p prompt left a real .bak.old on disk that
+// so a Ctrl-C at the h/c/s/p prompt left a real .grove-bak on disk that
 // blocked every subsequent `grove repair` with "refusing to repair"
 // until the user manually removed it, even though nothing had actually
 // gone wrong yet. Only once cloneOneDependencyDir is about to write
 // (fallback resolved to something other than skip, or the pool-init
 // retry lands on a fresh reflink) does dst get backed up.
-func repairOneDependencyDir(src, dst string, fallback *fallbackChoice) (fs.CloneMode, bool, error) {
+func repairOneDependencyDir(repoRoot, src, dst string, fallback *fallbackChoice) (fs.CloneMode, bool, error) {
 	if _, err := os.Stat(dst); err != nil {
 		return cloneOneDependencyDir(src, dst, fallback)
 	}
@@ -217,7 +228,7 @@ func repairOneDependencyDir(src, dst string, fallback *fallbackChoice) (fs.Clone
 		return mode, skipped, err
 	}
 
-	if err := backUpExistingDependencyDir(dst); err != nil {
+	if err := backUpExistingDependencyDir(repoRoot, dst); err != nil {
 		return 0, false, err
 	}
 	if err := os.Rename(staging, dst); err != nil {
@@ -226,17 +237,38 @@ func repairOneDependencyDir(src, dst string, fallback *fallbackChoice) (fs.Clone
 	return mode, false, nil
 }
 
+// recordBackupIfAny records path in the registry as a backup created by
+// source, if path is non-empty. Several operations (pool volume
+// migrations, dependency-dir repair) only sometimes produce a
+// .grove-bak — e.g. EnsureWorktreeVolume no-ops if the target is already
+// pool-resident — so callers pass through whatever backup path (possibly
+// empty) they got back rather than each re-implementing this check.
+func recordBackupIfAny(repoRoot, path, source string) error {
+	if path == "" {
+		return nil
+	}
+
+	reg, err := config.Load(repoRoot)
+	if err != nil {
+		return err
+	}
+	reg.AddBackup(path, source)
+	return reg.Save(repoRoot)
+}
+
 // backUpExistingDependencyDir moves dst out of the way before repair
-// writes a fresh clone in its place. With --force it removes dst outright
-// instead, since the whole point of --force is skipping this safety net.
-func backUpExistingDependencyDir(dst string) error {
+// writes a fresh clone in its place, and records the backup in the
+// registry so `grove cleanup`/`grove status` can find it without
+// walking the filesystem. With --force it removes dst outright instead,
+// since the whole point of --force is skipping this safety net.
+func backUpExistingDependencyDir(repoRoot, dst string) error {
 	if repairForce {
 		return os.RemoveAll(dst)
 	}
 
-	backup := dst + ".bak.old"
+	backup := dst + ".grove-bak"
 	if _, err := os.Stat(backup); err == nil {
-		return fmt.Errorf("refusing to repair %s: a previous .bak.old already exists at %s (remove or rename it first)", output.Path(dst), output.Path(backup))
+		return fmt.Errorf("refusing to repair %s: a previous .grove-bak already exists at %s (remove it with `grove cleanup` first)", output.Path(dst), output.Path(backup))
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -244,6 +276,10 @@ func backUpExistingDependencyDir(dst string) error {
 	if err := os.Rename(dst, backup); err != nil {
 		return err
 	}
-	fmt.Println(output.Dim(fmt.Sprintf("Kept previous copy of %s at %s (delete once verified)", dst, backup)))
+	if err := recordBackupIfAny(repoRoot, backup, "repair"); err != nil {
+		return err
+	}
+
+	fmt.Println(output.Dim(fmt.Sprintf("Kept previous copy of %s at %s (run `grove cleanup` once verified)", dst, backup)))
 	return nil
 }

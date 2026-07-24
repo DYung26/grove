@@ -35,8 +35,58 @@ type Worktree struct {
 	DepsCloneMode string `json:"deps_clone_mode,omitempty"`
 }
 
+// BackupEntry records a single <path>.grove-bak left behind by an
+// operation that chose to preserve pre-existing data rather than discard
+// it outright (grove repair's dependency-dir replacement, or a pool
+// migration moving a plain directory into a subvolume). Tracking these
+// in the registry at creation time, rather than rediscovering them later
+// by walking worktree paths and the pool mount for the .grove-bak
+// suffix, means `grove cleanup` and `grove status` never need to walk
+// anything, and a backup is still found even if the worktree that owned
+// it is later removed from the registry — Path is an absolute path,
+// independent of any single Worktree entry, so it survives that.
+type BackupEntry struct {
+	// Path is the absolute path to the backup itself (i.e. already
+	// ending in .grove-bak), not the original path it was renamed from.
+	Path      string    `json:"path"`
+	CreatedAt time.Time `json:"created_at"`
+	// Source names the command or operation that created this backup
+	// (e.g. "repair", "pool-migrate", "split-repo-volume"), shown in
+	// `grove cleanup` so the user has context for what it is without
+	// having to infer it from the path alone.
+	Source string `json:"source"`
+}
+
 type Registry struct {
-	Worktrees []Worktree `json:"worktrees"`
+	Worktrees []Worktree    `json:"worktrees"`
+	Backups   []BackupEntry `json:"backups,omitempty"`
+}
+
+// AddBackup records a newly created backup. Callers are expected to have
+// already performed the actual os.Rename; this only updates bookkeeping,
+// and does not itself Save the registry.
+func (r *Registry) AddBackup(path, source string) {
+	r.Backups = append(r.Backups, BackupEntry{
+		Path:      path,
+		CreatedAt: time.Now(),
+		Source:    source,
+	})
+}
+
+// RemoveBackup drops the tracked backup at the given path, if present.
+// Reports whether anything was actually removed. Does not itself remove
+// the backup file from disk — callers that are deleting the backup are
+// expected to do that themselves and only call this once the file
+// removal has already succeeded, so a failed deletion doesn't silently
+// lose track of a backup that's still actually sitting on disk.
+func (r *Registry) RemoveBackup(path string) bool {
+	for i, b := range r.Backups {
+		if b.Path == path {
+			r.Backups = append(r.Backups[:i], r.Backups[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func Load(repoRoot string) (*Registry, error) {
