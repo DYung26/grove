@@ -194,7 +194,7 @@ func repairDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, bool,
 		}
 	}
 
-	reportDependencyDirsFound(srcRoot, found, missing)
+	reportDependencyDirsFound(srcRoot, projectType, found, missing)
 	if !any {
 		return "", false, nil
 	}
