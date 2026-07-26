@@ -51,6 +51,7 @@ var signatures = []signature{
 	{Cargo, "Cargo.lock"},
 	{Python, "poetry.lock"},
 	{Python, "Pipfile.lock"},
+	{Python, "uv.lock"},
 	{Python, "requirements.txt"},
 	{Go, "go.mod"},
 }
