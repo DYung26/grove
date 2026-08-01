@@ -119,6 +119,14 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	var head git.HeadDescription
+	if newBranch {
+		head, err = git.DescribeHead()
+		if err != nil {
+			return err
+		}
+	}
+
 	worktreesDir, err := resolveWorktreesDir(repoRoot)
 	if err != nil {
 		return err
@@ -157,6 +165,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println(describeCreated(name, branch, worktreePath))
+	if newBranch {
+		fmt.Println(describeBranchedFrom(head))
+	}
 	return nil
 }
 
@@ -165,6 +176,16 @@ func runCreate(cmd *cobra.Command, args []string) error {
 // Branch are shown even when they're the same string right now.
 func describeCreated(name, branch, worktreePath string) string {
 	return fmt.Sprintf("%s Created worktree %s (branch %s) at %s", output.Success("✓"), output.Name(name), branch, output.Path(worktreePath))
+}
+
+// describeBranchedFrom reports the exact ref and commit a new branch was
+// cut from. `git worktree add -b` branches from HEAD in the worktree
+// `grove create` was run from, not necessarily the main repo — running
+// the same command from two worktrees on different branches silently
+// produces different base commits, so this is surfaced rather than left
+// implicit.
+func describeBranchedFrom(head git.HeadDescription) string {
+	return output.Dim(fmt.Sprintf("  branched from %s at %s", head.Ref, head.SHA))
 }
 
 // requireFreeWorktreePath checks worktreePath before `git worktree add`

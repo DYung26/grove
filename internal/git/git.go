@@ -40,6 +40,37 @@ func MainRepoRoot() (string, error) {
 	return filepath.Dir(commonDir), nil
 }
 
+// HeadDescription describes the current worktree's HEAD as a ref name
+// (branch, or "detached HEAD" when not on one) and short sha, for
+// callers that need to report exactly what a new branch was cut from —
+// `git worktree add -b` with no explicit start-point branches from
+// HEAD in the worktree it's run from, which callers can't otherwise see
+// or report.
+type HeadDescription struct {
+	Ref string
+	SHA string
+}
+
+// DescribeHead resolves HeadDescription for the repo/worktree the
+// current process is running in.
+func DescribeHead() (HeadDescription, error) {
+	ref, err := run("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return HeadDescription{}, err
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "HEAD" {
+		ref = "detached HEAD"
+	}
+
+	sha, err := run("rev-parse", "--short", "HEAD")
+	if err != nil {
+		return HeadDescription{}, err
+	}
+
+	return HeadDescription{Ref: ref, SHA: strings.TrimSpace(sha)}, nil
+}
+
 // BranchExists reports whether branch is a known local branch in the
 // current repo.
 func BranchExists(branch string) (bool, error) {
