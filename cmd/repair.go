@@ -159,28 +159,34 @@ func repairDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, bool,
 		return "", false, err
 	}
 
-	projectType := project.Detect(repoRoot)
-	dirs := config.ResolveDependencyDirs(builtinDependencyDirsByType[projectType], projectCfg)
+	dirs, err := resolveAllDependencyDirs(repoRoot, projectCfg)
+	if err != nil {
+		return "", false, err
+	}
 	if len(dirs) == 0 {
-		explainNoDependencyDirs(projectType)
+		projects, err := project.Scan(repoRoot)
+		if err != nil {
+			return "", false, err
+		}
+		explainNoDependencyDirs(projects)
 		return config.DepsCloneModeNone, true, nil
 	}
 
 	fallback := fallbackUndecided
 	worstMode := fs.CloneModeReflink
-	found := make([]string, 0, len(dirs))
-	missing := make([]string, 0, len(dirs))
+	found := make([]resolvedDependencyDir, 0, len(dirs))
+	missing := make([]resolvedDependencyDir, 0, len(dirs))
 	any := false
 
 	for _, dir := range dirs {
-		src := filepath.Join(srcRoot, dir)
+		src := filepath.Join(srcRoot, dir.Path)
 		if _, err := os.Stat(src); os.IsNotExist(err) {
 			missing = append(missing, dir)
 			continue
 		}
 		found = append(found, dir)
 
-		dst := filepath.Join(worktreePath, dir)
+		dst := filepath.Join(worktreePath, dir.Path)
 		mode, skipped, err := repairOneDependencyDir(repoRoot, src, dst, &fallback)
 		if err != nil {
 			return "", false, explainCloneFailure(err, worktreePath)
@@ -194,7 +200,7 @@ func repairDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, bool,
 		}
 	}
 
-	reportDependencyDirsFound(srcRoot, projectType, found, missing)
+	reportDependencyDirsFound(srcRoot, found, missing)
 	if !any {
 		return "", false, nil
 	}

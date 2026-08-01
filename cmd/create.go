@@ -78,6 +78,62 @@ func alternateGroupFor(projectType project.Type, dir string) (group []string, ok
 	return nil, false
 }
 
+// resolvedDependencyDir pairs a repo-root-relative dependency dir path
+// with the project it was resolved for, so per-dir reporting (which
+// alternates group a dir belongs to, which project type explains a dir
+// with no built-ins) still works once a repo can contain more than one
+// project. A dir added via .grove.json's dependency_dirs rather than
+// detected from a project carries a zero project.Project (Dir "", Type
+// project.Unknown) — it's not owned by any detected project, so
+// alternates/explanation logic simply finds no match for it, which is
+// correct: a user-added dir is never expected to have a sibling
+// convention or a canned "why zero dirs" explanation.
+type resolvedDependencyDir struct {
+	Path    string
+	Project project.Project
+}
+
+// resolveAllDependencyDirs finds every project under repoRoot (see
+// project.Scan) and resolves each one's built-in dependency dirs
+// relative to where that project's own lockfile actually lives, rather
+// than assuming a single project type hangs off repoRoot directly. This
+// is what makes a polyglot repo work correctly — e.g. a Rust crate
+// nested under core/ with no lockfile at the repo root at all still gets
+// "core/target" resolved, where a flat, repo-root-only check would never
+// have found the project at all. .grove.json's dependency_dirs/
+// exclude_dependency_dirs overrides still apply globally, matched by
+// their literal repo-root-relative string, on top of what's resolved
+// here.
+func resolveAllDependencyDirs(repoRoot string, projectCfg config.ProjectConfig) ([]resolvedDependencyDir, error) {
+	projects, err := project.Scan(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	owner := make(map[string]project.Project)
+	for _, p := range projects {
+		for _, dir := range builtinDependencyDirsByType[p.Type] {
+			path := dir
+			if p.Dir != "" {
+				path = filepath.Join(p.Dir, dir)
+			}
+			owner[path] = p
+		}
+	}
+
+	builtin := make([]string, 0, len(owner))
+	for path := range owner {
+		builtin = append(builtin, path)
+	}
+
+	resolved := config.ResolveDependencyDirs(builtin, projectCfg)
+	dirs := make([]resolvedDependencyDir, len(resolved))
+	for i, path := range resolved {
+		dirs[i] = resolvedDependencyDir{Path: path, Project: owner[path]}
+	}
+	return dirs, nil
+}
+
 var createCmd = &cobra.Command{
 	Use:   "create <branch>",
 	Short: "Create a new worktree for a branch",
@@ -327,10 +383,11 @@ func confirmPlainFallback() (bool, error) {
 // into worktreePath, and reports the worst CloneMode used across all of
 // them as a string suitable for config.Worktree.DepsCloneMode ("" if
 // --no-deps was set or no dependency dirs existed to clone). The
-// dependency-dir *list* is always resolved from repoRoot's .grove.json
-// (that config is a property of the project, not of any one worktree),
-// but the actual files cloned come from srcRoot, which callers may point
-// at a worktree other than the main repo via --from.
+// dependency-dir *list* is always resolved from repoRoot (project.Scan
+// plus repoRoot's .grove.json overrides — that config is a property of
+// the project, not of any one worktree), but the actual files cloned
+// come from srcRoot, which callers may point at a worktree other than
+// the main repo via --from.
 func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error) {
 	if createNoDeps {
 		fmt.Println(output.Dim("Skipping dependency dirs: --no-deps was set."))
@@ -342,10 +399,16 @@ func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error)
 		return "", err
 	}
 
-	projectType := project.Detect(repoRoot)
-	dirs := config.ResolveDependencyDirs(builtinDependencyDirsByType[projectType], projectCfg)
+	dirs, err := resolveAllDependencyDirs(repoRoot, projectCfg)
+	if err != nil {
+		return "", err
+	}
 	if len(dirs) == 0 {
-		explainNoDependencyDirs(projectType)
+		projects, err := project.Scan(repoRoot)
+		if err != nil {
+			return "", err
+		}
+		explainNoDependencyDirs(projects)
 		return config.DepsCloneModeNone, nil
 	}
 
@@ -355,19 +418,19 @@ func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error)
 	// `grove create` run rather than once per dir.
 	fallback := fallbackUndecided
 	worstMode := fs.CloneModeReflink
-	found := make([]string, 0, len(dirs))
-	missing := make([]string, 0, len(dirs))
+	found := make([]resolvedDependencyDir, 0, len(dirs))
+	missing := make([]resolvedDependencyDir, 0, len(dirs))
 	any := false
 
 	for _, dir := range dirs {
-		src := filepath.Join(srcRoot, dir)
+		src := filepath.Join(srcRoot, dir.Path)
 		if _, err := os.Stat(src); os.IsNotExist(err) {
 			missing = append(missing, dir)
 			continue
 		}
 		found = append(found, dir)
 
-		dst := filepath.Join(worktreePath, dir)
+		dst := filepath.Join(worktreePath, dir.Path)
 		mode, skipped, err := cloneOneDependencyDir(src, dst, &fallback)
 		if err != nil {
 			return "", explainCloneFailure(err, worktreePath)
@@ -381,7 +444,7 @@ func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error)
 		}
 	}
 
-	reportDependencyDirsFound(srcRoot, projectType, found, missing)
+	reportDependencyDirsFound(srcRoot, found, missing)
 	if !any {
 		return "", nil
 	}
@@ -397,32 +460,45 @@ func cloneDependencyDirs(repoRoot, srcRoot, worktreePath string) (string, error)
 //
 // A dir in missing is only reported when it isn't just the unmatched
 // sibling of an alternates group (see dependencyDirAlternates) where
-// another member was already found: e.g. once venv has been found for a
-// Python project, .venv being absent is expected, not a gap, so it's
-// filtered out here rather than printed alongside genuine misses.
-func reportDependencyDirsFound(srcRoot string, projectType project.Type, found, missing []string) {
+// another member of the *same project* was already found: e.g. once
+// venv has been found for a Python project, .venv being absent there is
+// expected, not a gap, so it's filtered out here rather than printed
+// alongside genuine misses.
+func reportDependencyDirsFound(srcRoot string, found, missing []resolvedDependencyDir) {
 	if len(found) > 0 {
-		fmt.Println(output.Dim(fmt.Sprintf("Found %s in %s.", strings.Join(found, ", "), output.Path(srcRoot))))
+		paths := make([]string, len(found))
+		for i, dir := range found {
+			paths[i] = dir.Path
+		}
+		fmt.Println(output.Dim(fmt.Sprintf("Found %s in %s.", strings.Join(paths, ", "), output.Path(srcRoot))))
 	}
 
 	genuinelyMissing := make([]string, 0, len(missing))
 	for _, dir := range missing {
-		group, ok := alternateGroupFor(projectType, dir)
-		if ok && groupHasMatch(group, found) {
+		group, ok := alternateGroupFor(dir.Project.Type, filepath.Base(dir.Path))
+		if ok && groupHasMatchInProject(group, dir.Project, found) {
 			continue
 		}
-		genuinelyMissing = append(genuinelyMissing, dir)
+		genuinelyMissing = append(genuinelyMissing, dir.Path)
 	}
 	if len(genuinelyMissing) > 0 {
 		fmt.Println(output.Warn(fmt.Sprintf("Not found in %s, nothing to clone: %s.", output.Path(srcRoot), strings.Join(genuinelyMissing, ", "))))
 	}
 }
 
-// groupHasMatch reports whether any member of group is present in found.
-func groupHasMatch(group, found []string) bool {
+// groupHasMatchInProject reports whether any dir in found both belongs
+// to the same project as owner and has a base name in group — e.g.
+// "core/venv" is only a match for "core/.venv" being missing, not for an
+// unrelated top-level ".venv" belonging to a different project in the
+// same repo.
+func groupHasMatchInProject(group []string, owner project.Project, found []resolvedDependencyDir) bool {
 	for _, f := range found {
+		if f.Project != owner {
+			continue
+		}
+		base := filepath.Base(f.Path)
 		for _, g := range group {
-			if f == g {
+			if base == g {
 				return true
 			}
 		}
@@ -701,24 +777,36 @@ func reflinkUnavailableMessage(src string) string {
 		output.Warn("Note:"), output.Path(src), output.Command("grove pool init"), output.Command("--from <worktree>"))
 }
 
-// explainNoDependencyDirs tells the user why a project type resolved to
-// zero dependency dirs to clone, rather than silently doing nothing —
-// the reasoning differs by ecosystem (pnpm's node_modules is symlinks
-// into a shared store, Go's module cache lives outside the repo
-// entirely), and without an explanation it looks identical to Grove
-// having failed to detect the project at all.
-func explainNoDependencyDirs(projectType project.Type) {
-	var reason string
-	switch projectType {
-	case project.PNPM:
-		reason = "pnpm's node_modules is mostly symlinks into a shared global store, so there's nothing worth reflinking"
-	case project.Go:
-		reason = "Go's module cache lives outside the repo (GOPATH/pkg/mod), shared across worktrees already"
-	default:
-		fmt.Println(output.Dim("No dependency dirs to clone for this project."))
-		return
+// explainNoDependencyDirs tells the user why zero dependency dirs were
+// resolved to clone, rather than silently doing nothing. Ecosystems with
+// a known reason for having no built-ins (pnpm's node_modules is
+// symlinks into a shared store, Go's module cache lives outside the
+// repo entirely) get an explanation per detected project; anything else
+// — including no projects detected at all — gets a generic message.
+// Without this, zero dirs looks identical to Grove having failed to
+// detect the project(s) at all.
+func explainNoDependencyDirs(projects []project.Project) {
+	explained := false
+	for _, p := range projects {
+		var reason string
+		switch p.Type {
+		case project.PNPM:
+			reason = "pnpm's node_modules is mostly symlinks into a shared global store, so there's nothing worth reflinking"
+		case project.Go:
+			reason = "Go's module cache lives outside the repo (GOPATH/pkg/mod), shared across worktrees already"
+		default:
+			continue
+		}
+		label := p.Type.String()
+		if p.Dir != "" {
+			label = fmt.Sprintf("%s (%s)", label, p.Dir)
+		}
+		fmt.Println(output.Dim(fmt.Sprintf("Skipping dependency dirs for %s: %s.", label, reason)))
+		explained = true
 	}
-	fmt.Println(output.Dim(fmt.Sprintf("Skipping dependency dirs for %s: %s.", projectType, reason)))
+	if !explained {
+		fmt.Println(output.Dim("No dependency dirs to clone for this project."))
+	}
 	fmt.Println(output.Dim("Add dependency_dirs in .grove.json to opt back in."))
 }
 

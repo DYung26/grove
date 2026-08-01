@@ -10,7 +10,6 @@ import (
 	"github.com/dyung/grove/internal/config"
 	"github.com/dyung/grove/internal/git"
 	"github.com/dyung/grove/internal/pool"
-	"github.com/dyung/grove/internal/project"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 )
@@ -94,13 +93,27 @@ func collectWorktreeSavings(reg *config.Registry, dirs []string) ([]worktreeSavi
 	return results, nil
 }
 
+// resolveRepoDependencyDirs returns the flat list of repo-root-relative
+// dependency dir paths, discarding the per-dir project ownership that
+// resolveAllDependencyDirs also carries — savings.go and
+// ensureDepsSourcePoolResident only ever need the paths, not which
+// project each belongs to.
 func resolveRepoDependencyDirs(repoRoot string) ([]string, error) {
 	projectCfg, err := config.LoadProjectConfig(repoRoot)
 	if err != nil {
 		return nil, err
 	}
-	projectType := project.Detect(repoRoot)
-	return config.ResolveDependencyDirs(builtinDependencyDirsByType[projectType], projectCfg), nil
+
+	resolved, err := resolveAllDependencyDirs(repoRoot, projectCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	dirs := make([]string, len(resolved))
+	for i, r := range resolved {
+		dirs[i] = r.Path
+	}
+	return dirs, nil
 }
 
 // sumDirUsage measures each of dirs under root and adds them together,
