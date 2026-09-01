@@ -1,12 +1,15 @@
 package pool
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/dyung/grove/internal/fs"
 	"github.com/dyung/grove/internal/output"
 )
 
@@ -231,7 +234,7 @@ func migrateIntoSubvolume(subvolume, sibling string) (string, error) {
 		return "", fmt.Errorf("install rsync: %w", err)
 	}
 
-	if err := runLocal("rsync", "-a", sibling+"/", subvolume+"/"); err != nil {
+	if err := runLocalRsync(sibling+"/", subvolume+"/"); err != nil {
 		return "", fmt.Errorf("copy existing %s into pool: %w", sibling, err)
 	}
 
@@ -252,6 +255,42 @@ func runLocal(name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// runLocalRsync runs `rsync -a src dst`, same as the plain runLocal
+// calls elsewhere in this file, but additionally captures stderr so a
+// destination-full failure can be recognized and wrapped in
+// fs.ErrNoSpace — the same sentinel internal/fs/clone.go's copy fallback
+// uses for the same underlying condition, so callers in cmd/ have one
+// error to check regardless of which code path (fs's Go-native copy, or
+// pool's shelled-out rsync) actually hit the full pool. Without this,
+// migrating a whole worktree container into a full pool (this file) and
+// migrating a dependency dir into a full pool (internal/fs) surfaced two
+// differently-shaped errors for the identical underlying cause, and only
+// one of them was ever recognized well enough to suggest a fix.
+//
+// rsync's own exit code for this case (code 11, "Error in file IO") also
+// covers other, unrelated IO failures, so this matches on stderr text
+// rather than trusting the exit code alone: rsync consistently prints
+// "No space left on device" (from the underlying ENOSPC write failure)
+// regardless of rsync version or protocol, where the exit code by itself
+// wouldn't distinguish "disk full" from "permission denied mid-transfer"
+// or any other IO error also mapped to 11.
+func runLocalRsync(src, dst string) error {
+	cmd := exec.Command("rsync", "-a", src, dst)
+	cmd.Stdout = os.Stdout
+
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(stderr.String(), "No space left on device") {
+		return fmt.Errorf("%w: %s", fs.ErrNoSpace, dst)
+	}
+	return err
 }
 
 // DeleteSubvolume removes the single Btrfs subvolume backing linkPath

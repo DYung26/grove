@@ -6,6 +6,7 @@ package pool
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -564,6 +565,291 @@ func Recreate(paths Paths, sizeGB uint64) error {
 	}
 
 	return Init(paths, sizeGB)
+}
+
+// Usage reports the pool image's total and used bytes, via `df`-style
+// statfs against the mount point rather than the image file's own
+// (sparse, so meaningless) size on disk. Used both by `grove pool status`
+// to warn before a caller hits ENOSPC mid-operation, and by the command
+// layer to suggest a sensible default grow amount.
+func Usage(mountPoint string) (usedBytes, totalBytes uint64, err error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(mountPoint, &stat); err != nil {
+		return 0, 0, err
+	}
+
+	totalBytes = stat.Blocks * uint64(stat.Bsize)
+	freeBytes := stat.Bfree * uint64(stat.Bsize)
+	if freeBytes > totalBytes {
+		// Defensive: btrfs's own overcommit/allocation accounting can, in rare
+		// cases, make Bfree momentarily exceed Blocks as seen through statfs.
+		// Reporting 0 used rather than wrapping to a huge uint64 keeps this a
+		// harmless "can't tell right now" instead of a wildly wrong number.
+		return 0, totalBytes, nil
+	}
+	return totalBytes - freeBytes, totalBytes, nil
+}
+
+// ErrShrinkTargetTooSmall is returned by Shrink when targetGB doesn't
+// leave enough headroom above the pool's current usage. Checked with
+// Usage's *used* bytes rather than comparing targetGB against current
+// total capacity: shrinking to anything at or above current usage plus
+// shrinkHeadroomFraction is what actually determines whether btrfs can
+// relocate existing data into the smaller space, not whether the target
+// is technically less than today's size.
+type ErrShrinkTargetTooSmall struct {
+	TargetGB uint64
+	UsedGB   float64
+	MinGB    uint64
+}
+
+func (e *ErrShrinkTargetTooSmall) Error() string {
+	return fmt.Sprintf("target size %dG doesn't leave enough room above the pool's current usage (%.1fG used); choose at least %dG", e.TargetGB, e.UsedGB, e.MinGB)
+}
+
+// shrinkHeadroomFraction is the fraction of extra room (beyond current
+// usage) Shrink insists on keeping. btrfs's own accounting, and the fact
+// that a running system may write more data between this check and the
+// resize actually happening, mean shrinking to exactly current usage is
+// asking for the resize to fail partway through relocating data —
+// leaving this margin is what turns "btrfs shrink fails deep inside
+// relocation with a cryptic error" into "Grove refuses up front with a
+// clear one", the whole point of checking usage before attempting this
+// at all.
+const shrinkHeadroomFraction = 0.10
+
+// minShrinkTargetGB computes the smallest target size Shrink will accept
+// for a pool currently using usedBytes: current usage plus
+// shrinkHeadroomFraction of headroom, rounded up to a whole GiB so the
+// suggested minimum is never itself too tight.
+func minShrinkTargetGB(usedBytes uint64) uint64 {
+	minBytes := float64(usedBytes) * (1 + shrinkHeadroomFraction)
+	return uint64(minBytes/(1<<30)) + 1
+}
+
+// ValidateShrinkTarget checks whether targetGB is a safe shrink target
+// for the pool at paths — enough headroom above current usage (see
+// ErrShrinkTargetTooSmall), and actually smaller than the pool's current
+// size — without touching anything on disk. Exported so the command
+// layer can reject an unsafe target before asking the user to confirm a
+// destructive-sounding prompt, rather than only finding out after they've
+// already said yes. Shrink calls this internally too, so it stays safe
+// against any other caller that skips this pre-check.
+func ValidateShrinkTarget(paths Paths, targetGB uint64) error {
+	mounted, err := IsMounted(paths.MountPoint)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return fmt.Errorf("pool isn't mounted (run `grove pool init` first)")
+	}
+
+	usedBytes, totalBytes, err := Usage(paths.MountPoint)
+	if err != nil {
+		return fmt.Errorf("check current pool usage: %w", err)
+	}
+
+	minGB := minShrinkTargetGB(usedBytes)
+	if targetGB < minGB {
+		return &ErrShrinkTargetTooSmall{TargetGB: targetGB, UsedGB: float64(usedBytes) / (1 << 30), MinGB: minGB}
+	}
+
+	currentGB := totalBytes / (1 << 30)
+	if targetGB >= currentGB {
+		return fmt.Errorf("target size %dG isn't smaller than the pool's current size (%dG); use `grove pool resize +N` to grow instead", targetGB, currentGB)
+	}
+
+	return nil
+}
+
+// Shrink shrinks the pool to targetGB gigabytes: first shrinks the live
+// btrfs filesystem down with `btrfs filesystem resize`, then truncates
+// the backing file down to match, then refreshes the loop device
+// attached to it (see refreshLoopDeviceSize) so the kernel's own view of
+// the file's size matches what's actually on disk. The pool must already
+// be mounted.
+//
+// This is the exact reverse order from Resize's grow path, and
+// necessarily so: btrfs needs the device at its *original*, larger size
+// while it relocates any data or metadata currently sitting in the
+// region being cut off, so shrinking the backing file first would leave
+// nowhere for that relocation to happen. Truncating only after btrfs
+// confirms it fit into the smaller size is also what keeps a failed
+// attempt safe to retry or abandon: if the btrfs resize step fails, this
+// returns immediately with the backing file and loop device untouched,
+// rather than leaving them shrunk out from under a btrfs filesystem that
+// never actually got smaller.
+//
+// targetGB is checked via ValidateShrinkTarget before anything is
+// touched, precisely so a target that's technically smaller than today's
+// total but doesn't leave btrfs anywhere to relocate into is rejected
+// with a clear message up front instead of failing deep inside the
+// btrfs resize itself.
+func Shrink(paths Paths, targetGB uint64) error {
+	if err := ValidateShrinkTarget(paths, targetGB); err != nil {
+		return err
+	}
+
+	targetBytes := targetGB << 30
+
+	if err := runSudo("btrfs", "filesystem", "resize", fmt.Sprintf("%d", targetBytes), paths.MountPoint); err != nil {
+		return fmt.Errorf("shrink btrfs filesystem (backing file and loop device are untouched — safe to retry or abandon): %w", err)
+	}
+
+	if err := runSudo("truncate", "-s", fmt.Sprintf("%dG", targetGB), paths.Image); err != nil {
+		return fmt.Errorf("btrfs filesystem was already shrunk to %dG, but truncating the backing file to match failed (re-run `grove pool shrink %d` to retry just this step, or `sudo truncate -s %dG %s` directly): %w", targetGB, targetGB, targetGB, paths.Image, err)
+	}
+
+	if err := refreshLoopDeviceSize(paths.Image); err != nil {
+		return fmt.Errorf("btrfs filesystem and backing file were already shrunk to reflect this, but the loop device attached to it wasn't told about the new size: %w", err)
+	}
+
+	return nil
+}
+
+// currentImageSizeBytes returns image's own apparent (not disk/sparse)
+// size, via os.Stat, rather than trusting the btrfs filesystem's current
+// size (as reported by Usage/statfs) to reflect it. These two can
+// legitimately disagree — if a prior resize attempt grew the backing
+// file but failed or was interrupted before the loop device/btrfs step
+// caught up (see refreshLoopDeviceSize), the file is already larger than
+// what btrfs currently sees. Computing the next truncate target from the
+// file's real size, rather than from the btrfs-visible size, is what
+// keeps a retry after such a partial failure correct instead of
+// re-adding the same delta on top of space that's already there.
+func currentImageSizeBytes(image string) (uint64, error) {
+	info, err := os.Stat(image)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(info.Size()), nil
+}
+
+// ErrShrinkNotSupported is returned by Resize when deltaGB is 0, since a
+// no-op delta isn't a valid grow request. Shrinking has its own
+// dedicated path — see Shrink — with a different precondition order and
+// its own headroom check, so Resize itself never attempts it.
+var ErrShrinkNotSupported = errors.New("shrinking isn't supported via Resize; use Shrink instead")
+
+// Resize grows the pool by deltaGB gigabytes: extends the sparse backing
+// file with `truncate`, refreshes the loop device attached to it so the
+// kernel picks up the new size (see refreshLoopDeviceSize), then grows
+// the live btrfs filesystem to fill it with `btrfs filesystem resize
+// max`. The pool must already be mounted — Resize doesn't mount, create,
+// or otherwise provision it (see Init for that).
+//
+// Order matters and is not reversible by swapping it: `btrfs filesystem
+// resize` asks the block device for its current size, and a loop device
+// only reflects a truncated backing file's new size once explicitly told
+// to re-read it — so each step here depends on the one before it having
+// actually taken effect first, not just been issued.
+//
+// deltaGB must be positive; see ErrShrinkNotSupported for why shrinking
+// is out of scope. Every step runs via sudo (see runSudo) since
+// truncating a file systemd/fstab may reference, reattaching a loop
+// device, and resizing a mounted filesystem all need root on most
+// systems, the same as every other pool operation that touches the image
+// or its mount.
+func Resize(paths Paths, deltaGB uint64) error {
+	if deltaGB == 0 {
+		return ErrShrinkNotSupported
+	}
+
+	mounted, err := IsMounted(paths.MountPoint)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return fmt.Errorf("pool isn't mounted (run `grove pool init` first)")
+	}
+
+	if err := checkResizeHeadroom(filepath.Dir(paths.Image), deltaGB); err != nil {
+		return err
+	}
+
+	beforeBytes, err := currentImageSizeBytes(paths.Image)
+	if err != nil {
+		return fmt.Errorf("check current pool image size: %w", err)
+	}
+
+	if err := runSudo("truncate", "-s", fmt.Sprintf("+%dG", deltaGB), paths.Image); err != nil {
+		return fmt.Errorf("grow backing file: %w", err)
+	}
+
+	afterBytes, sizeErr := currentImageSizeBytes(paths.Image)
+	if sizeErr == nil && afterBytes != beforeBytes+(deltaGB<<30) {
+		// truncate reported success but the file didn't end up at the expected
+		// size — surface this rather than silently proceeding to resize btrfs
+		// against a file that isn't the size Resize thinks it is.
+		fmt.Printf("%s pool image is now %.1fG (expected %.1fG) — proceeding, but double-check with `grove pool status` after this completes.\n",
+			output.Warn("Note:"), float64(afterBytes)/(1<<30), float64(beforeBytes+(deltaGB<<30))/(1<<30))
+	}
+
+	if err := refreshLoopDeviceSize(paths.Image); err != nil {
+		return fmt.Errorf("backing file was grown to reflect this, but the loop device attached to it wasn't told about the new size (needed before btrfs can see the extra space): %w", err)
+	}
+
+	if err := runSudo("btrfs", "filesystem", "resize", "max", paths.MountPoint); err != nil {
+		return fmt.Errorf("grow btrfs filesystem (backing file and loop device were already grown to reflect this — re-run `grove pool resize` to retry just this step, or `sudo btrfs filesystem resize max %s` directly): %w", paths.MountPoint, err)
+	}
+
+	return nil
+}
+
+// refreshLoopDeviceSize tells the kernel to re-read the current size of
+// image's backing file into whichever loop device it's attached to, via
+// `losetup -c` (LOOP_SET_CAPACITY). A loop device caches the backing
+// file's size as of when it was attached — growing the file underneath
+// it with truncate doesn't implicitly propagate, so without this step
+// `btrfs filesystem resize` (which asks the block device for its size,
+// not the file directly) sees the same old size and "resize max" becomes
+// a no-op that still reports success. Confirmed live on this machine:
+// truncating pool.img from 10G to 15G and then running `btrfs filesystem
+// resize max` left the filesystem at exactly 10G, silently.
+//
+// Requires exactly one loop device attached to image — the same
+// precondition mountImage's own attachment-count handling already
+// assumes elsewhere in this file, since Resize only ever runs against an
+// already-mounted pool.
+func refreshLoopDeviceSize(image string) error {
+	devices, err := existingLoopDevices(image)
+	if err != nil {
+		return err
+	}
+	switch len(devices) {
+	case 0:
+		return fmt.Errorf("%s has no attached loop device (expected exactly one for an already-mounted pool)", image)
+	case 1:
+		return runSudo("losetup", "-c", devices[0])
+	default:
+		return fmt.Errorf("%s is attached to %d loop devices at once (%s); refusing to guess which one to resize — see `grove pool status` and resolve the extra attachment first", image, len(devices), strings.Join(devices, ", "))
+	}
+}
+
+// checkResizeHeadroom applies the same maxUsableFraction guard Init uses
+// for the initial pool size to a resize's delta, against dir's *current*
+// free space — growing the pool is still bounded by how much real disk
+// is actually available on the host filesystem the image file itself
+// lives on, same constraint, just against the additional amount rather
+// than the whole requested size.
+func checkResizeHeadroom(dir string, deltaGB uint64) error {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(dir, &stat); err != nil {
+		return err
+	}
+
+	availableBytes := stat.Bavail * uint64(stat.Bsize)
+	requestedBytes := deltaGB << 30
+	limit := float64(availableBytes) * maxUsableFraction
+	if float64(requestedBytes) > limit {
+		availableGB := float64(availableBytes) / (1 << 30)
+		return &SizeExceedsLimitError{
+			RequestedGB: deltaGB,
+			MaxGB:       maxUsableSizeGB(availableBytes),
+			AvailableGB: availableGB,
+		}
+	}
+	return nil
 }
 
 // removeFstabEntry strips any line referencing mountPoint from

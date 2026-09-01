@@ -72,7 +72,7 @@ func runRepair(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ensureWorktreePoolResident(repoRoot, name, wt.Path); err != nil {
-		return err
+		return explainPoolMigrateFailure(err)
 	}
 
 	depsSrcRoot, err := resolveDepsSourceRoot(repoRoot, repairFrom)

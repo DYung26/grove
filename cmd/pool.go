@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/dyung/grove/internal/config"
@@ -48,10 +49,17 @@ var poolRepairCmd = &cobra.Command{
 	RunE:  runPoolRepair,
 }
 
+var poolResizeCmd = &cobra.Command{
+	Use:   "resize <+N | -N | N>",
+	Short: "Resize the pool: grow by N GiB (+N), shrink by N GiB (-N), or resize to N GiB total (N)",
+	Args:  exactArgs(1),
+	RunE:  runPoolResize,
+}
+
 func init() {
 	poolInitCmd.Flags().Uint64Var(&poolInitSizeGB, "size", pool.DefaultSizeGB, "pool size in GiB")
 	poolRepairCmd.Flags().BoolVar(&poolRepairForce, "force", false, "skip confirmation before recreating the pool")
-	poolCmd.AddCommand(poolInitCmd, poolStatusCmd, poolMigrateCmd, poolRepairCmd)
+	poolCmd.AddCommand(poolInitCmd, poolStatusCmd, poolMigrateCmd, poolRepairCmd, poolResizeCmd)
 	rootCmd.AddCommand(poolCmd)
 }
 
@@ -329,6 +337,202 @@ func confirmPoolRecreate() (bool, error) {
 	return answer == "y" || answer == "yes", nil
 }
 
+// resizeAction is what parseResizeArg resolved the command's argument
+// into: either grow by/to a GiB amount, or shrink by/to one. Kept
+// distinct from a signed delta so runPoolResize can route to pool.Resize
+// or pool.Shrink explicitly rather than inferring direction from a sign
+// a second time.
+type resizeAction struct {
+	shrink  bool
+	gb      uint64 // delta for +N/-N, absolute target for bare N
+	isDelta bool
+}
+
+// runPoolResize grows or shrinks the pool's image and live btrfs
+// filesystem according to parseResizeArg's interpretation of args[0].
+// Confirms the pool is mounted up front purely for a clearer error
+// message before doing any work — pool.Resize/pool.Shrink independently
+// check this too, since they're library functions other callers could
+// reach without going through this command.
+func runPoolResize(cmd *cobra.Command, args []string) error {
+	paths, err := pool.DefaultPaths()
+	if err != nil {
+		return err
+	}
+
+	mounted, err := pool.IsMounted(paths.MountPoint)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return fmt.Errorf("pool isn't mounted (run %s first)", output.Command("grove pool init"))
+	}
+
+	action, err := parseResizeArg(args[0], paths.MountPoint)
+	if err != nil {
+		return err
+	}
+
+	if action.shrink {
+		return runPoolShrink(paths, action)
+	}
+	return runPoolGrow(paths, action)
+}
+
+// runPoolGrow handles the grow branch of runPoolResize: no confirmation
+// needed since growing an already-mounted pool can't destroy anything,
+// same reasoning `grove pool init`'s own size fallback already relies
+// on.
+func runPoolGrow(paths pool.Paths, action resizeAction) error {
+	fmt.Printf("Growing pool by %dG...\n", action.gb)
+	if err := pool.Resize(paths, action.gb); err != nil {
+		return err
+	}
+
+	_, totalBytes, err := pool.Usage(paths.MountPoint)
+	if err != nil {
+		// Resize itself already succeeded; a follow-up Usage failure here is
+		// just "can't report the new total", not a reason to fail the command.
+		fmt.Printf("%s Pool grown by %dG\n", output.Success("✓"), action.gb)
+		return nil
+	}
+
+	fmt.Printf("%s Pool grown by %dG (now %.0fG total)\n", output.Success("✓"), action.gb, float64(totalBytes)/(1<<30))
+	return nil
+}
+
+// runPoolShrink handles the shrink branch of runPoolResize. Validates the
+// target via pool.ValidateShrinkTarget before ever asking for
+// confirmation, so an unsafe target (not enough headroom above current
+// usage) is rejected up front instead of the user having to say yes to a
+// destructive-sounding prompt just to find out it would have been
+// refused anyway. Only a target that already passed validation reaches
+// the confirmation prompt, the same pattern confirmPoolRecreate uses for
+// grove pool repair's destructive path.
+func runPoolShrink(paths pool.Paths, action resizeAction) error {
+	targetGB, err := resolveShrinkTargetGB(paths.MountPoint, action)
+	if err != nil {
+		return err
+	}
+
+	if err := pool.ValidateShrinkTarget(paths, targetGB); err != nil {
+		return err
+	}
+
+	confirmed, err := confirmPoolShrink(targetGB)
+	if err != nil {
+		return err
+	}
+	if !confirmed {
+		fmt.Println(output.Dim("Aborted: pool left unchanged."))
+		return nil
+	}
+
+	fmt.Printf("Shrinking pool to %dG...\n", targetGB)
+	if err := pool.Shrink(paths, targetGB); err != nil {
+		return err
+	}
+
+	fmt.Printf("%s Pool shrunk to %dG\n", output.Success("✓"), targetGB)
+	return nil
+}
+
+// resolveShrinkTargetGB turns action (already known to be a shrink) into
+// the absolute target size Shrink needs: action.gb directly if the user
+// gave a bare target, or the current size minus action.gb if they used
+// -N. Resolving -N against the pool's current total here, rather than
+// inside pool.Shrink, keeps pool.Shrink's own signature in terms of an
+// absolute target throughout — the same shape Resize's grow path takes
+// as a delta, kept in the command layer instead since only this layer
+// needs to support both spellings.
+func resolveShrinkTargetGB(mountPoint string, action resizeAction) (uint64, error) {
+	if !action.isDelta {
+		return action.gb, nil
+	}
+
+	_, totalBytes, err := pool.Usage(mountPoint)
+	if err != nil {
+		return 0, fmt.Errorf("determine current pool size: %w", err)
+	}
+	currentGB := totalBytes / (1 << 30)
+
+	if action.gb >= currentGB {
+		return 0, fmt.Errorf("-%dG would shrink below 0 (pool is currently %dG)", action.gb, currentGB)
+	}
+	return currentGB - action.gb, nil
+}
+
+// confirmPoolShrink asks before rewriting the pool down to a smaller
+// size, the same [y/N] pattern confirmPoolRecreate uses for grove pool
+// repair's destructive path.
+func confirmPoolShrink(targetGB uint64) (bool, error) {
+	fmt.Printf("This will shrink the live pool filesystem down to %dG. Existing subvolumes and their data are unaffected — only unused space is reclaimed.\n", targetGB)
+	fmt.Print("Shrink the pool? [y/N] ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false, err
+	}
+
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
+}
+
+// parseResizeArg interprets the command's single positional argument
+// three ways:
+//
+//   - "+N" grows the pool by N GiB.
+//   - "-N" shrinks the pool by N GiB.
+//   - "N" (no sign) is treated as a target *total* size in GiB, matching
+//     the mental model `grove pool init --size N` already establishes
+//     elsewhere in this same command tree: "I want the pool to be N GiB",
+//     not "I want to add/remove N GiB from whatever it happens to be
+//     right now". Whether that target is above or below the pool's
+//     current size (via pool.Usage) decides grow vs. shrink.
+//
+// A bare target exactly equal to the pool's current size is rejected —
+// there's nothing to do, and silently succeeding would hide a likely
+// typo (e.g. reading the current size off `grove pool status` and
+// retyping it by mistake) rather than surfacing it.
+func parseResizeArg(arg, mountPoint string) (resizeAction, error) {
+	if strings.HasPrefix(arg, "+") {
+		deltaGB, err := strconv.ParseUint(strings.TrimPrefix(arg, "+"), 10, 64)
+		if err != nil {
+			return resizeAction{}, fmt.Errorf("invalid size %q: expected a whole number of GiB, e.g. +10", arg)
+		}
+		return resizeAction{shrink: false, gb: deltaGB, isDelta: true}, nil
+	}
+
+	if strings.HasPrefix(arg, "-") {
+		deltaGB, err := strconv.ParseUint(strings.TrimPrefix(arg, "-"), 10, 64)
+		if err != nil {
+			return resizeAction{}, fmt.Errorf("invalid size %q: expected a whole number of GiB, e.g. -10", arg)
+		}
+		return resizeAction{shrink: true, gb: deltaGB, isDelta: true}, nil
+	}
+
+	targetGB, err := strconv.ParseUint(arg, 10, 64)
+	if err != nil {
+		return resizeAction{}, fmt.Errorf("invalid size %q: expected a whole number of GiB, e.g. 30, +10, or -10", arg)
+	}
+
+	_, totalBytes, err := pool.Usage(mountPoint)
+	if err != nil {
+		return resizeAction{}, fmt.Errorf("determine current pool size: %w", err)
+	}
+	currentGB := totalBytes / (1 << 30)
+
+	switch {
+	case targetGB == currentGB:
+		return resizeAction{}, fmt.Errorf("pool is already %dG; nothing to do", currentGB)
+	case targetGB > currentGB:
+		return resizeAction{shrink: false, gb: targetGB - currentGB, isDelta: false}, nil
+	default:
+		return resizeAction{shrink: true, gb: targetGB, isDelta: false}, nil
+	}
+}
+
 func runPoolStatus(cmd *cobra.Command, args []string) error {
 	paths, err := pool.DefaultPaths()
 	if err != nil {
@@ -356,7 +560,52 @@ func runPoolStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("%s pool mounted at %s\n", output.Success("✓"), output.Path(paths.MountPoint))
+	reportPoolUsage(paths.MountPoint)
 	return reportOrphanSubvolumes(paths.MountPoint)
+}
+
+// poolUsageWarnFraction is the fraction of pool capacity above which
+// `grove pool status` proactively suggests `grove pool resize`, so
+// running out of room is a warning the user sees ahead of time rather
+// than an rsync/copy failure discovered mid-operation (the situation
+// that motivated this: a create.go worktree migration failing with a
+// bare "No space left on device" only after committing to the copy).
+const poolUsageWarnFraction = 0.85
+
+// reportPoolUsage prints the pool's current usage and, once it's above
+// poolUsageWarnFraction of capacity, suggests a concrete `grove pool
+// resize` amount rather than just flagging that it's getting full. Purely
+// informational — a Usage failure here is reported but doesn't fail the
+// rest of `grove pool status`, since usage reporting is a bonus on top of
+// the mount/read-only check above, not the reason someone runs the
+// command in the first place.
+func reportPoolUsage(mountPoint string) {
+	usedBytes, totalBytes, err := pool.Usage(mountPoint)
+	if err != nil {
+		fmt.Println(output.Warn("Note: couldn't determine pool usage: ") + err.Error())
+		return
+	}
+	if totalBytes == 0 {
+		return
+	}
+
+	usedGB := float64(usedBytes) / (1 << 30)
+	totalGB := float64(totalBytes) / (1 << 30)
+	fraction := float64(usedBytes) / float64(totalBytes)
+
+	fmt.Printf("  %.1fG / %.0fG used (%.0f%%)\n", usedGB, totalGB, fraction*100)
+
+	if fraction < poolUsageWarnFraction {
+		return
+	}
+
+	// Suggest growing by roughly a quarter of the current size, rounded up
+	// to a whole GiB, so the suggestion scales with the pool instead of
+	// offering the same fixed amount to someone on a 12G pool and someone on
+	// a 200G one.
+	suggestedGB := uint64(totalGB/4) + 1
+	fmt.Printf("%s pool is %.0f%% full — grow it before this blocks a `grove create`/`grove repair`: %s\n",
+		output.Warn("⚠"), fraction*100, output.Commandf("grove pool resize +%d", suggestedGB))
 }
 
 // reportOrphanSubvolumes lists every top-level subvolume actually in the

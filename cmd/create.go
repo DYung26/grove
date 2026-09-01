@@ -203,7 +203,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ensureWorktreePoolResident(repoRoot, name, worktreePath); err != nil {
-		return err
+		return explainPoolMigrateFailure(err)
 	}
 
 	depsSrcRoot, err := resolveDepsSourceRoot(repoRoot, createFrom)
@@ -826,8 +826,14 @@ func reportCloneMode(mode fs.CloneMode) {
 }
 
 // explainCloneFailure turns a bare out-of-space error into guidance the
-// user can act on: pool-growth commands if the failure happened inside
-// the Grove pool, general disk-space advice otherwise.
+// user can act on: a concrete `grove pool resize` suggestion if the
+// failure happened inside the Grove pool, general disk-space advice
+// otherwise. Shared by cmd/create.go's dependency-dir clone step and
+// cmd/repair.go's re-clone step; ensureWorktreePoolResident's own
+// rsync-based container migration goes through explainPoolMigrateFailure
+// instead, since that failure isn't wrapped in fs.ErrNoSpace by the same
+// code path (see internal/pool/repo.go's runLocalRsync) even though it's
+// the same underlying condition.
 func explainCloneFailure(err error, worktreePath string) error {
 	if !errors.Is(err, fs.ErrNoSpace) {
 		return fmt.Errorf("clone dependency dir: %w", err)
@@ -835,13 +841,37 @@ func explainCloneFailure(err error, worktreePath string) error {
 
 	paths, poolErr := pool.DefaultPaths()
 	if poolErr == nil && strings.HasPrefix(worktreePath, paths.MountPoint) {
-		return fmt.Errorf("%w\nthe Grove pool is full; grow it with:\n  %s\n  %s\n(pick N for however much more space you need)",
-			err,
-			output.Commandf("truncate -s +N %s", paths.Image),
-			output.Commandf("sudo btrfs filesystem resize +N %s", paths.MountPoint))
+		return fmt.Errorf("%w\n%s", err, poolFullMessage())
 	}
 
 	return fmt.Errorf("%w\nout of disk space at %s; free up space and try again", err, output.Path(worktreePath))
+}
+
+// poolFullMessage is the shared "the pool is full, here's how to fix it"
+// text both explainCloneFailure and explainPoolMigrateFailure fall back
+// to, so growing the pool is described identically regardless of which
+// operation (dependency-dir clone vs. whole-worktree migration) hit
+// ENOSPC first. Suggests a fixed +5G bump rather than computing one:
+// unlike pool status's proactive warning (which knows the pool's current
+// size and can scale its suggestion), this fires from deep inside a
+// failed clone/migrate with no cheap way to re-check usage without risking
+// masking the original error with a second failure, and +5G is a small
+// enough ask to rarely need a second attempt.
+func poolFullMessage() string {
+	return fmt.Sprintf("the Grove pool is full; grow it with %s (pick a larger amount if you need more headroom), then retry", output.Command("grove pool resize +5"))
+}
+
+// explainPoolMigrateFailure is explainCloneFailure's counterpart for
+// ensureWorktreePoolResident's rsync-based container migration
+// (EnsureWorktreeVolume, via internal/pool/repo.go), the failure this
+// project was actually hit by: `grove create` ran `git worktree add`
+// successfully, then failed moving the new worktree's container into the
+// pool with a bare "No space left on device" and no pointer to a fix.
+func explainPoolMigrateFailure(err error) error {
+	if !errors.Is(err, fs.ErrNoSpace) {
+		return err
+	}
+	return fmt.Errorf("%w\n%s", err, poolFullMessage())
 }
 
 func recordWorktree(repoRoot, name, branch, worktreePath, depsCloneMode string) error {
