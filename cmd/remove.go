@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/dyung/grove/internal/config"
@@ -51,7 +52,11 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		return removeUnhealthyWorktree(repoRoot, reg, wt, status)
 	}
 
-	if err := git.WorktreeRemove(wt.Path, removeForce); err != nil {
+	resolvedPath := resolveWorktreeRemovePath(wt.Path)
+	if err := git.WorktreeRepair(resolvedPath); err != nil {
+		return fmt.Errorf("repair worktree metadata for %q before removal: %w", name, err)
+	}
+	if err := git.WorktreeRemove(resolvedPath, removeForce); err != nil {
 		return err
 	}
 
@@ -61,7 +66,122 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("%s Removed worktree %s\n", output.Success("✓"), output.Name(name))
+	return removeBranchIfWanted(wt.Branch)
+}
+
+// resolveWorktreeRemovePath resolves path (the registry's recorded
+// worktree path, always the <repo>.wt/<name> location) through any
+// symlink before handing it to git.WorktreeRepair and git.WorktreeRemove.
+// A pool-resident worktree lives at that path only as a symlink into the
+// Grove pool — EnsureWorktreeVolume swaps the real directory there for
+// one once migration completes (see internal/pool/repo.go) — and `git
+// worktree remove` refuses to operate through a symlink at all ("Not a
+// directory"). Resolving the symlink alone isn't sufficient on its own,
+// though: git's own .git/worktrees/<name>/gitdir record still points at
+// the original symlink path from when `git worktree add` first ran, so
+// WorktreeRepair also needs the resolved path to bring that record back
+// in sync before removal — otherwise `git worktree remove` reads the
+// stale gitdir internally and fails or leaves the worktree half torn
+// down even when called with a correct, resolved path argument. Mirrors
+// isPoolResident's own EvalSymlinks-based resolution elsewhere in this
+// package. If path isn't a symlink (or doesn't exist), EvalSymlinks
+// returns it unchanged.
+func resolveWorktreeRemovePath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	return resolved
+}
+
+// removeBranchIfWanted asks whether to delete branch now that its
+// worktree is gone, mirroring `git worktree remove`'s own scope: it only
+// ever removes the worktree checkout and git's internal record for it,
+// never touches the branch ref itself, so a leftover branch after `grove
+// remove` is expected git behavior, not a bug — this is Grove choosing
+// to offer the follow-up rather than leaving the user to remember
+// `git branch -d` themselves. Skipped entirely under --force, matching
+// removeForce's documented scope (skips confirmation prompts), rather
+// than force-deleting a branch the user never explicitly asked to lose.
+func removeBranchIfWanted(branch string) error {
+	if removeForce || branch == "" {
+		return nil
+	}
+
+	exists, err := git.BranchExists(branch)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		// Already gone (e.g. deleted manually, or never existed as a real
+		// local branch — an adopted worktree's Branch field can be empty or
+		// stale). Nothing to offer.
+		return nil
+	}
+
+	confirmed, err := confirmBranchDelete(branch)
+	if err != nil {
+		return err
+	}
+	if !confirmed {
+		return nil
+	}
+
+	ok, err := git.BranchDeleteSafe(branch)
+	if err != nil {
+		return fmt.Errorf("delete branch %q: %w", branch, err)
+	}
+	if ok {
+		fmt.Printf("%s Deleted branch %s\n", output.Success("✓"), output.Name(branch))
+		return nil
+	}
+
+	return deleteUnmergedBranch(branch)
+}
+
+// deleteUnmergedBranch handles the case git branch -d itself refused:
+// branch has commits not merged anywhere else, so deleting it would
+// discard them permanently. This is confirmed as a second, more
+// explicit prompt rather than silently escalating to -D, since it's a
+// meaningfully more destructive action than the merged-branch case the
+// user already agreed to.
+func deleteUnmergedBranch(branch string) error {
+	fmt.Printf("%s Branch %q has commits not merged anywhere else — deleting it would discard them permanently.\n", output.Warn("⚠"), branch)
+	fmt.Print("Force-delete it anyway? [y/N] ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer != "y" && answer != "yes" {
+		fmt.Printf("Branch %s left in place.\n", output.Name(branch))
+		return nil
+	}
+
+	if err := git.BranchDeleteForce(branch); err != nil {
+		return fmt.Errorf("force-delete branch %q: %w", branch, err)
+	}
+	fmt.Printf("%s Force-deleted branch %s\n", output.Success("✓"), output.Name(branch))
 	return nil
+}
+
+// confirmBranchDelete asks whether to delete branch now that its
+// worktree is gone, the same [y/N] pattern the rest of this file uses
+// for consequential-but-recoverable actions.
+func confirmBranchDelete(branch string) (bool, error) {
+	fmt.Printf("Also delete branch %s? [y/N] ", output.Name(branch))
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false, err
+	}
+
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
 }
 
 // removeUnhealthyWorktree handles a tracked worktree whose directory

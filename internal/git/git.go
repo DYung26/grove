@@ -112,6 +112,44 @@ func WorktreeRemove(path string, force bool) error {
 	return err
 }
 
+// WorktreeRepair re-syncs the two-way administrative link between a
+// worktree's own .git file and the main repo's .git/worktrees/<name>/gitdir
+// entry, for path. Needed before WorktreeRemove whenever the worktree's
+// directory was relocated (e.g. resolved from a symlink) after `git
+// worktree add` first ran: without it, `git worktree remove` still reads
+// gitdir's stale reference internally even when called with the correct,
+// resolved path, and fails or leaves inconsistent state instead of
+// cleanly removing the worktree.
+func WorktreeRepair(path string) error {
+	_, err := run("worktree", "repair", path)
+	return err
+}
+
+// BranchDeleteSafe deletes branch via `git branch -d`, which git itself
+// refuses if the branch has commits not merged into its upstream or the
+// current HEAD. Returns ok=false (not an error) for that specific,
+// expected refusal, so callers can offer -D as a distinct, explicit
+// choice rather than a plain command failure.
+func BranchDeleteSafe(branch string) (ok bool, err error) {
+	_, err = run("branch", "-d", branch)
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(err.Error(), "not fully merged") {
+		return false, nil
+	}
+	return false, err
+}
+
+// BranchDeleteForce deletes branch via `git branch -D`, bypassing the
+// merged-into-upstream check BranchDeleteSafe enforces. Callers are
+// responsible for confirming this with the user first, since it can
+// discard commits that exist nowhere else.
+func BranchDeleteForce(branch string) error {
+	_, err := run("branch", "-D", branch)
+	return err
+}
+
 // WorktreePrune runs `git worktree prune`, git's own cleanup for
 // worktree administrative state (the entry under .git/worktrees/) whose
 // directory no longer exists on disk at all. This is the correct
