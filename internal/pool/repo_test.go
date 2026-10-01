@@ -65,3 +65,36 @@ func TestEnsureDependencyDirVolumeReconcilesExistingSubvolume(t *testing.T) {
 		t.Fatalf("second reconciliation returned backup %q, want empty", backup)
 	}
 }
+
+func TestDeleteSubvolumeForRollbackFallsBackToEmptySubvolumeRemoval(t *testing.T) {
+	binDir := t.TempDir()
+	fakeBtrfs := filepath.Join(binDir, "btrfs")
+	if err := os.WriteFile(fakeBtrfs, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	mountPoint := t.TempDir()
+	subvolume := filepath.Join(mountPoint, "rollback-subvolume")
+	if err := os.MkdirAll(filepath.Join(subvolume, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subvolume, "nested", "file"), []byte("disposable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkPath := filepath.Join(t.TempDir(), "worktree")
+	if err := os.Symlink(subvolume, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DeleteSubvolumeForRollback(linkPath, mountPoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(linkPath); !os.IsNotExist(err) {
+		t.Fatalf("rollback symlink still exists: %v", err)
+	}
+	if _, err := os.Lstat(subvolume); !os.IsNotExist(err) {
+		t.Fatalf("rollback subvolume still exists: %v", err)
+	}
+}
