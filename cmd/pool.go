@@ -679,12 +679,10 @@ func reportOrphanSubvolumes(mountPoint string) error {
 // EnsureWorktreeVolume/EnsureDependencyDirVolume would have used for
 // every tracked worktree's own container and each of its resolved
 // dependency dirs, forming the "known good" set reportOrphanSubvolumes
-// checks the pool's actual contents against. Rebuilds the naming
-// convention ("<repo>-<label>", "<repo>-<label>-<depdir>") rather than
-// exporting a shared helper from internal/pool, since this needs the
-// pattern, not a filesystem check against any specific existing path —
-// an orphan by definition has no live symlink left pointing at it for a
-// resolve-through-symlink approach to follow.
+// checks the pool's actual contents against. Dependency volume names are
+// built by the shared pool helpers so status uses exactly the same naming
+// rules as creation; legacy basename-only names are also accepted for
+// backwards compatibility with already-migrated top-level dependency dirs.
 func expectedSubvolumeNames(repoRoot, repoName string, reg *config.Registry) map[string]bool {
 	expected := make(map[string]bool)
 	expected[fmt.Sprintf("%s-main", repoName)] = true
@@ -694,13 +692,15 @@ func expectedSubvolumeNames(repoRoot, repoName string, reg *config.Registry) map
 		dirs = nil // best-effort: an unreadable .grove.json shouldn't block the rest of the check
 	}
 	for _, dir := range dirs {
-		expected[fmt.Sprintf("%s-main-%s", repoName, filepath.Base(dir))] = true
+		expected[pool.DependencyVolumeName(repoName, "main", dir)] = true
+		expected[pool.LegacyDependencyVolumeName(repoName, "main", dir)] = true
 	}
 
 	for _, wt := range reg.Worktrees {
 		expected[fmt.Sprintf("%s-%s", repoName, wt.Name)] = true
 		for _, dir := range dirs {
-			expected[fmt.Sprintf("%s-%s-%s", repoName, wt.Name, filepath.Base(dir))] = true
+			expected[pool.DependencyVolumeName(repoName, wt.Name, dir)] = true
+			expected[pool.LegacyDependencyVolumeName(repoName, wt.Name, dir)] = true
 		}
 	}
 	return expected

@@ -98,3 +98,17 @@ func TestDeleteSubvolumeForRollbackFallsBackToEmptySubvolumeRemoval(t *testing.T
 		t.Fatalf("rollback subvolume still exists: %v", err)
 	}
 }
+
+func TestDependencyVolumeNameDistinguishesNestedSameBasename(t *testing.T) {
+	daemon := DependencyVolumeName("demo", "main", "daemon/node_modules")
+	extension := DependencyVolumeName("demo", "main", "extension/node_modules")
+	if daemon == extension {
+		t.Fatalf("nested dependency volume names collide: %q", daemon)
+	}
+	if daemon != DependencyVolumeName("demo", "main", "daemon/node_modules") {
+		t.Fatal("dependency volume name is not deterministic")
+	}
+	if LegacyDependencyVolumeName("demo", "main", "daemon/node_modules") != "demo-main-node_modules" {
+		t.Fatalf("legacy name changed unexpectedly")
+	}
+}
