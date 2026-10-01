@@ -60,16 +60,37 @@ func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot
 
 	info, err := os.Lstat(sibling)
 	switch {
-	case os.IsNotExist(err):
-		return sibling, "", createSubvolume(subvolume, sibling)
-	case err != nil:
+	case err != nil && !os.IsNotExist(err):
 		return sibling, "", err
-	case info.Mode()&os.ModeSymlink != 0:
-		return sibling, "", nil
-	default:
-		backup, err := migrateIntoSubvolume(subvolume, sibling)
+	case err == nil && info.Mode()&os.ModeSymlink != 0:
+		_, resolveErr := filepath.EvalSymlinks(sibling)
+		if resolveErr == nil {
+			return sibling, "", nil
+		}
+		if !os.IsNotExist(resolveErr) {
+			return sibling, "", resolveErr
+		}
+		// A dangling dependency symlink can be repaired if its expected
+		// subvolume is still present. Treat it like a missing sibling below.
+		if err := os.Remove(sibling); err != nil {
+			return sibling, "", err
+		}
+		info = nil
+	case err == nil:
+		backup, err := migrateIntoExistingOrNewSubvolume(subvolume, sibling)
 		return sibling, backup, err
 	}
+
+	if subvolumeExists, err := dependencySubvolumeExists(subvolume); err != nil {
+		return sibling, "", err
+	} else if subvolumeExists {
+		if err := os.Symlink(subvolume, sibling); err != nil {
+			return sibling, "", err
+		}
+		return sibling, "", nil
+	}
+
+	return sibling, "", createSubvolume(subvolume, sibling)
 }
 
 // EnsureWorktreeVolume makes sure a single already-existing worktree
@@ -216,6 +237,48 @@ func SplitRepoVolume(mountPoint, repoRoot string, trackedNames []string) (migrat
 
 	fmt.Println(output.Dim(fmt.Sprintf("Migrated %s into per-worktree subvolumes; original container kept at %s (run `grove cleanup` once verified)", output.Path(container), output.Path(backup))))
 	return true, backup, nil
+}
+
+func dependencySubvolumeExists(subvolume string) (bool, error) {
+	if _, err := os.Lstat(subvolume); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+
+	cmd := exec.Command("btrfs", "subvolume", "show", subvolume)
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("existing dependency volume %s is not a Btrfs subvolume: %w", subvolume, err)
+	}
+	return true, nil
+}
+
+func migrateIntoExistingOrNewSubvolume(subvolume, sibling string) (string, error) {
+	exists, err := dependencySubvolumeExists(subvolume)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return migrateIntoSubvolume(subvolume, sibling)
+	}
+
+	if err := ensureCommand("rsync", "rsync", nil); err != nil {
+		return "", fmt.Errorf("install rsync: %w", err)
+	}
+	if err := runLocalRsync(sibling+"/", subvolume+"/"); err != nil {
+		return "", fmt.Errorf("reconcile existing pool dependency volume %s from %s: %w", subvolume, sibling, err)
+	}
+
+	backup := sibling + ".grove-bak"
+	if err := os.Rename(sibling, backup); err != nil {
+		return "", err
+	}
+	if err := os.Symlink(subvolume, sibling); err != nil {
+		return "", err
+	}
+
+	fmt.Println(output.Dim(fmt.Sprintf("Reconciled existing %s from %s; original kept at %s (run `grove cleanup` once verified)", output.Path(subvolume), output.Path(sibling), output.Path(backup))))
+	return backup, nil
 }
 
 func createSubvolume(subvolume, sibling string) error {
