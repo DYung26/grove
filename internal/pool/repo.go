@@ -386,3 +386,40 @@ func DeleteSubvolume(linkPath, mountPoint string) error {
 	}
 	return os.Remove(linkPath)
 }
+
+// DeleteSubvolumeForRollback removes a newly-created pool subvolume during
+// create rollback. Normal subvolume deletion is intentionally delegated to
+// btrfs, but some Grove pool mounts omit user_subvol_rm_allowed; in that
+// configuration an unprivileged owner can still remove an empty subvolume
+// through rmdir(2). Because a just-created worktree is disposable on a
+// failed create, this fallback clears its contents and removes the now-empty
+// subvolume instead of requiring an interactive sudo password.
+func DeleteSubvolumeForRollback(linkPath, mountPoint string) error {
+	subvolume, err := filepath.EvalSymlinks(linkPath)
+	if err != nil {
+		return fmt.Errorf("resolve %s to its pool subvolume: %w", linkPath, err)
+	}
+	if !strings.HasPrefix(subvolume, mountPoint) {
+		return fmt.Errorf("%s resolves to %s, which isn't inside the pool at %s — refusing rollback deletion", linkPath, subvolume, mountPoint)
+	}
+
+	if err := runLocal("btrfs", "subvolume", "delete", subvolume); err == nil {
+		return os.Remove(linkPath)
+	}
+
+	// btrfs subvolume delete does not expose stderr through runLocal's
+	// returned error, so permission-shaped failures arrive here simply as
+	// an exit status. This path is safe to fall back from because the
+	// subvolume was created by this failed create invocation and is therefore
+	// disposable; if the filesystem rejects clearing it too, the original
+	// subvolume remains intact and rollback reports that failure.
+	if err := os.RemoveAll(subvolume); err != nil {
+		return fmt.Errorf("clear rollback subvolume %s after unprivileged delete was denied: %w", subvolume, err)
+	}
+	if _, err := os.Lstat(subvolume); err == nil {
+		return fmt.Errorf("rollback subvolume %s still exists after clearing it", subvolume)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check rollback subvolume %s after clearing it: %w", subvolume, err)
+	}
+	return os.Remove(linkPath)
+}

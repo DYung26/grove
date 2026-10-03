@@ -30,8 +30,8 @@ var builtinDependencyDirsByType = map[project.Type][]string{
 	// meaningful CoW win from cloning it, just a wasted directory walk. A
 	// project that needs it cloned anyway can add "node_modules" back via
 	// dependency_dirs in .grove.json.
-	project.PNPM:   {},
-	project.Cargo:  {"target"},
+	project.PNPM:  {},
+	project.Cargo: {"target"},
 	// Both .venv and venv are checked: .venv is the more common modern
 	// convention (and what tools like `python -m venv .venv` and poetry
 	// default to), but plain venv is still common enough in older or
@@ -202,22 +202,29 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	rollback := func(cause error) error {
+		if rollbackErr := rollbackCreatedWorktree(repoRoot, name, branch, worktreePath, newBranch); rollbackErr != nil {
+			return fmt.Errorf("%w (rollback also failed: %v)", cause, rollbackErr)
+		}
+		return cause
+	}
+
 	if err := ensureWorktreePoolResident(repoRoot, name, worktreePath); err != nil {
-		return explainPoolMigrateFailure(err)
+		return rollback(explainPoolMigrateFailure(err))
 	}
 
 	depsSrcRoot, err := resolveDepsSourceRoot(repoRoot, createFrom)
 	if err != nil {
-		return err
+		return rollback(err)
 	}
 
 	depsCloneMode, err := cloneDependencyDirs(repoRoot, depsSrcRoot, worktreePath)
 	if err != nil {
-		return err
+		return rollback(err)
 	}
 
 	if err := recordWorktree(repoRoot, name, branch, worktreePath, depsCloneMode); err != nil {
-		return err
+		return rollback(err)
 	}
 
 	fmt.Println(describeCreated(name, branch, worktreePath))
@@ -225,6 +232,80 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		fmt.Println(describeBranchedFrom(head))
 	}
 	return nil
+}
+
+// rollbackCreatedWorktree removes everything created by runCreate after the
+// git worktree was added. It deliberately runs only on failures after that
+// point, and only deletes the branch when this invocation created it.
+//
+// A pool-resident worktree needs special ordering: its visible path is a
+// symlink into a pool subvolume and its original git worktree directory is
+// kept at <path>.grove-bak. Delete the pool subvolume first, restore that
+// original directory, then let git remove the worktree normally. This keeps
+// the .git worktree metadata usable long enough for git to clean itself up.
+func rollbackCreatedWorktree(repoRoot, name, branch, worktreePath string, newBranch bool) error {
+	var rollbackErr error
+
+	paths, err := pool.DefaultPaths()
+	if err != nil {
+		rollbackErr = err
+	} else if mounted, mountErr := pool.IsMounted(paths.MountPoint); mountErr != nil {
+		rollbackErr = mountErr
+	} else if mounted && isPoolResident(worktreePath, paths.MountPoint) {
+		if err := pool.DeleteSubvolumeForRollback(worktreePath, paths.MountPoint); err != nil {
+			rollbackErr = fmt.Errorf("delete created pool worktree: %w", err)
+		}
+	}
+
+	backup := worktreePath + ".grove-bak"
+	if _, statErr := os.Stat(backup); statErr == nil {
+		if _, pathErr := os.Lstat(worktreePath); pathErr == nil {
+			if removeErr := os.Remove(worktreePath); removeErr != nil && rollbackErr == nil {
+				rollbackErr = removeErr
+			}
+		}
+		if rollbackErr == nil {
+			if err := os.Rename(backup, worktreePath); err != nil {
+				rollbackErr = fmt.Errorf("restore original worktree from backup: %w", err)
+			}
+		}
+	}
+
+	if _, statErr := os.Stat(worktreePath); statErr == nil {
+		if err := git.WorktreeRepair(worktreePath); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("repair worktree metadata during rollback: %w", err)
+		}
+		if err := git.WorktreeRemove(worktreePath, true); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("remove worktree during rollback: %w", err)
+		}
+	} else if os.IsNotExist(statErr) {
+		if err := git.WorktreePrune(); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("prune worktree metadata during rollback: %w", err)
+		}
+	} else if rollbackErr == nil {
+		rollbackErr = statErr
+	}
+
+	reg, regErr := config.Load(repoRoot)
+	if regErr == nil {
+		removedWorktree := reg.Remove(name)
+		removedBackup := reg.RemoveBackup(backup)
+		if removedWorktree || removedBackup {
+			if saveErr := reg.Save(repoRoot); saveErr != nil && rollbackErr == nil {
+				rollbackErr = fmt.Errorf("remove rollback metadata: %w", saveErr)
+			}
+		}
+	} else if rollbackErr == nil {
+		rollbackErr = regErr
+	}
+
+	if newBranch {
+		if err := git.BranchDeleteForce(branch); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("delete newly-created branch %q during rollback: %w", branch, err)
+		}
+	}
+
+	return rollbackErr
 }
 
 // describeCreated reports the worktree's name, branch, and path,
