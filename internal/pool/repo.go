@@ -2,6 +2,7 @@ package pool
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -54,9 +55,24 @@ func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot
 	if err := requireSafeVolumeLabel(worktreeLabel); err != nil {
 		return "", "", err
 	}
-	volumeName := fmt.Sprintf("%s-%s-%s", repoName, worktreeLabel, filepath.Base(depRelPath))
+	volumeName := DependencyVolumeName(repoName, worktreeLabel, depRelPath)
 	sibling := filepath.Join(worktreeRoot, depRelPath)
 	subvolume := filepath.Join(mountPoint, volumeName)
+
+	// Preserve an existing legacy name for a top-level dependency dir so
+	// upgrading Grove doesn't duplicate an otherwise healthy volume. Nested
+	// dependency dirs always use the path-encoded name because the legacy
+	// basename-only scheme is inherently ambiguous there.
+	if !strings.Contains(filepath.ToSlash(filepath.Clean(depRelPath)), "/") {
+		legacy := filepath.Join(mountPoint, LegacyDependencyVolumeName(repoName, worktreeLabel, depRelPath))
+		if legacy != subvolume {
+			if _, err := os.Lstat(subvolume); os.IsNotExist(err) {
+				if _, err := os.Lstat(legacy); err == nil {
+					subvolume = legacy
+				}
+			}
+		}
+	}
 
 	info, err := os.Lstat(sibling)
 	switch {
@@ -91,6 +107,25 @@ func EnsureDependencyDirVolume(mountPoint, repoName, worktreeLabel, worktreeRoot
 	}
 
 	return sibling, "", createSubvolume(subvolume, sibling)
+}
+
+// DependencyVolumeName returns the collision-safe pool volume name for a
+// dependency directory. The complete repo-relative dependency path is encoded
+// into the final component rather than reduced to filepath.Base, so two
+// nested projects with the same dependency-dir basename remain distinct.
+// Raw URL-safe base64 is used because it is unpadded and contains only
+// filename-safe characters.
+func DependencyVolumeName(repoName, worktreeLabel, depRelPath string) string {
+	clean := filepath.ToSlash(filepath.Clean(depRelPath))
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(clean))
+	return fmt.Sprintf("%s-%s-dep-%s", repoName, worktreeLabel, encoded)
+}
+
+// LegacyDependencyVolumeName returns the basename-only name used by Grove
+// before nested dependency directories were supported. It is kept only for
+// compatibility with already-migrated top-level dependency dirs.
+func LegacyDependencyVolumeName(repoName, worktreeLabel, depRelPath string) string {
+	return fmt.Sprintf("%s-%s-%s", repoName, worktreeLabel, filepath.Base(depRelPath))
 }
 
 // EnsureWorktreeVolume makes sure a single already-existing worktree
