@@ -30,8 +30,8 @@ var builtinDependencyDirsByType = map[project.Type][]string{
 	// meaningful CoW win from cloning it, just a wasted directory walk. A
 	// project that needs it cloned anyway can add "node_modules" back via
 	// dependency_dirs in .grove.json.
-	project.PNPM:   {},
-	project.Cargo:  {"target"},
+	project.PNPM:  {},
+	project.Cargo: {"target"},
 	// Both .venv and venv are checked: .venv is the more common modern
 	// convention (and what tools like `python -m venv .venv` and poetry
 	// default to), but plain venv is still common enough in older or
@@ -135,10 +135,11 @@ func resolveAllDependencyDirs(repoRoot string, projectCfg config.ProjectConfig) 
 }
 
 var createCmd = &cobra.Command{
-	Use:   "create <branch>",
-	Short: "Create a new worktree for a branch",
-	Args:  exactArgs(1),
-	RunE:  runCreate,
+	Use:               "create <branch>",
+	ValidArgsFunction: completeLocalBranches,
+	Short:             "Create a new worktree for a branch",
+	Args:              exactArgs(1),
+	RunE:              runCreate,
 }
 
 var createNoDeps bool

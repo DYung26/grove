@@ -12,10 +12,11 @@ import (
 )
 
 var renameCmd = &cobra.Command{
-	Use:   "rename <old-name> <new-name>",
-	Short: "Rename a tracked worktree, moving its directory and updating the registry",
-	Args:  exactArgs(2),
-	RunE:  runRename,
+	Use:               "rename <old-name> <new-name>",
+	ValidArgsFunction: completeRenameArgs,
+	Short:             "Rename a tracked worktree, moving its directory and updating the registry",
+	Args:              exactArgs(2),
+	RunE:              runRename,
 }
 
 func init() {

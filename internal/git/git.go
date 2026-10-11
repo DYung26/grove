@@ -88,6 +88,21 @@ func BranchExists(branch string) (bool, error) {
 	return false, err
 }
 
+// ListLocalBranches returns local branch names in Git's ref sort order.
+func ListLocalBranches() ([]string, error) {
+	out, err := run("for-each-ref", "--format=%(refname:short)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for _, branch := range strings.Split(out, "\n") {
+		if branch = strings.TrimSpace(branch); branch != "" {
+			branches = append(branches, branch)
+		}
+	}
+	return branches, nil
+}
+
 func WorktreeAdd(path, branch string) error {
 	_, err := run("worktree", "add", path, branch)
 	return err

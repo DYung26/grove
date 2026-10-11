@@ -18,11 +18,12 @@ var repairForce bool
 var repairFrom string
 
 var repairCmd = &cobra.Command{
-	Use:     "repair <name>",
-	Aliases: []string{"sync-deps"},
-	Short:   "Retrofit a worktree onto the pool (container and dependency dirs) so it can actually reflink",
-	Args:    exactArgs(1),
-	RunE:    runRepair,
+	Use:               "repair <name>",
+	ValidArgsFunction: completeWorktreeNames,
+	Aliases:           []string{"sync-deps"},
+	Short:             "Retrofit a worktree onto the pool (container and dependency dirs) so it can actually reflink",
+	Args:              exactArgs(1),
+	RunE:              runRepair,
 }
 
 func init() {

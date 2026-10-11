@@ -15,10 +15,11 @@ import (
 var openPrint bool
 
 var openCmd = &cobra.Command{
-	Use:   "open <name-or-branch>",
-	Short: "Open any worktree by its Grove name or git branch (including the main repo)",
-	Args:  exactArgs(1),
-	RunE:  runOpen,
+	Use:               "open <name-or-branch>",
+	ValidArgsFunction: completeWorktreeNamesAndBranches,
+	Short:             "Open any worktree by its Grove name or git branch (including the main repo)",
+	Args:              exactArgs(1),
+	RunE:              runOpen,
 }
 
 func init() {

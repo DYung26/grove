@@ -18,11 +18,12 @@ import (
 var removeForce bool
 
 var removeCmd = &cobra.Command{
-	Use:     "remove <name>",
-	Aliases: []string{"rm"},
-	Short:   "Remove a tracked worktree",
-	Args:    exactArgs(1),
-	RunE:    runRemove,
+	Use:               "remove <name>",
+	ValidArgsFunction: completeWorktreeNames,
+	Aliases:           []string{"rm"},
+	Short:             "Remove a tracked worktree",
+	Args:              exactArgs(1),
+	RunE:              runRemove,
 }
 
 func init() {
