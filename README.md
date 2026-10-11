@@ -40,6 +40,7 @@ cd my-project
 grove create feature-x        # new worktree, deps cloned via CoW
 grove open feature-x          # drop into a subshell inside it
 grove list                    # see every worktree Grove is tracking
+grove install-completions     # install shell completion for your shell
 grove remove feature-x        # done with it — clean it up
 ```
 
@@ -49,6 +50,8 @@ grove remove feature-x        # done with it — clean it up
 |---|---|
 | `grove create <branch>` | Creates a new worktree for `branch` (making the branch too, if it doesn't exist yet) and clones its dependency dirs in via reflink, falling back gracefully if the destination can't support it. |
 | `grove list` | Lists every worktree Grove is currently tracking. |
+| `grove completion <shell>` | Prints a shell completion script for `bash`, `zsh`, `fish`, or `powershell`; you can source or install the output yourself. |
+| `grove install-completions [shell]` | Installs a completion script in the current user's shell completion directory. Auto-detects from `$SHELL` if omitted. Use `--shell` to specify the shell, or `--force` to replace an existing Grove completion file. |
 | `grove open <name-or-branch>` | Drops you into a subshell rooted at the worktree, matched against Grove's tracked name first and falling back to any git branch (works for the main repo too). `--print` prints the bare path instead, for `cd $(grove open <name-or-branch> --print)`. |
 | `grove rename <old-name> <new-name>` | Renames a tracked worktree: moves its directory via `git worktree move` and updates the registry to match, so its branch and git state stay correctly linked at the new path. |
 | `grove remove <branch>` (alias `rm`) | Removes the worktree and stops tracking it. `--force` removes it even with uncommitted changes. |
@@ -59,6 +62,12 @@ grove remove feature-x        # done with it — clean it up
 | `grove savings` (alias `du`) | Shows how much disk space CoW is actually saving: each tracked worktree's dependency-dir size on disk vs. what it would be without CoW, which clone mode (reflink/hardlink/copy/n/a) it's using, and a total across every worktree. |
 | `grove pool init` | Sets up the Btrfs loopback pool used for CoW on filesystems without native reflink support, and moves the current repo's own dependency dirs into it (symlinked back into place) so they become a valid reflink source. Idempotent, safe to re-run. `--size` sets the size in GiB. |
 | `grove pool status` | Shows whether the pool is currently mounted. |
+
+### Shell completions
+
+Run `grove install-completions` to install completions for the shell named by `$SHELL` (Bash is the fallback on Unix; PowerShell is the fallback on Windows). Or choose one explicitly with `grove install-completions zsh`, `grove install-completions fish`, and so on. Existing completion files are not overwritten unless `--force` is passed. `grove completion <shell>` remains available to print the generated script without installing it.
+
+The generated completion supports Grove commands, subcommands, flags and the following dynamic values: local Git branches for `grove create`; tracked Grove worktree names for `grove remove`, `grove repair` and the first argument of `grove rename`; and both tracked names and local branch names for `grove open`. Completion values are discovered at tab-completion time from the current repository, not cached in the script. Remote-only branches are not included unless they also exist as local branches. File installation and shell activation are distinct: Grove reports any shell-specific setup still required (for example, enabling Zsh `compinit` or sourcing the PowerShell script in your profile).
 
 Both `grove create` and `grove repair` also take:
 
