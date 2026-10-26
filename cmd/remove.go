@@ -196,6 +196,10 @@ func confirmBranchDelete(branch string) (bool, error) {
 // A plain (non-pool) worktree in this state has no narrower fix Grove
 // can offer; the underlying filesystem itself needs manual attention.
 func removeUnhealthyWorktree(repoRoot string, reg *config.Registry, wt config.Worktree, status fs.HealthStatus) error {
+	return removeUnhealthyWorktreeWithForce(repoRoot, reg, wt, status, removeForce)
+}
+
+func removeUnhealthyWorktreeWithForce(repoRoot string, reg *config.Registry, wt config.Worktree, status fs.HealthStatus, force bool) error {
 	if status == fs.Missing {
 		return removeMissingWorktree(repoRoot, reg, wt)
 	}
@@ -223,7 +227,7 @@ func removeUnhealthyWorktree(repoRoot string, reg *config.Registry, wt config.Wo
 		return fmt.Errorf("the Grove pool itself is read-only, so its subvolumes can't be deleted yet — run %s first, then re-run `grove remove %s`", output.Command("grove pool repair"), wt.Name)
 	}
 
-	if !removeForce {
+	if !force {
 		confirmed, err := confirmSubvolumeDelete(wt.Name, status)
 		if err != nil {
 			return err

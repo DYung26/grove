@@ -115,6 +115,60 @@ func WorktreeAddNewBranch(path, branch string) error {
 	return err
 }
 
+// WorktreeStatus reports git's working-tree and index state for a worktree.
+type WorktreeStatus struct {
+	Staged    bool
+	Unstaged  bool
+	Untracked bool
+}
+
+// InspectWorktreeStatus reads porcelain status without modifying the worktree.
+func InspectWorktreeStatus(path string) (WorktreeStatus, error) {
+	out, err := runIn(path, "status", "--porcelain=v1", "--untracked-files=normal")
+	if err != nil {
+		return WorktreeStatus{}, err
+	}
+	var status WorktreeStatus
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		x, y := line[0], line[1]
+		if x == '?' && y == '?' {
+			status.Untracked = true
+			continue
+		}
+		if x != ' ' {
+			status.Staged = true
+		}
+		if y != ' ' {
+			status.Unstaged = true
+		}
+	}
+	return status, nil
+}
+
+// AheadBehind reports commits unique to HEAD and to the configured upstream.
+// hasUpstream=false means no upstream exists, so push status is unknown.
+func AheadBehind(path string) (ahead, behind int, hasUpstream bool, err error) {
+	upstream, err := runIn(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	if err != nil {
+		message := err.Error()
+		if strings.Contains(message, "no upstream configured") || strings.Contains(message, "unknown revision") || strings.Contains(message, "ambiguous argument") {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, err
+	}
+	counts, err := runIn(path, "rev-list", "--left-right", "--count", "HEAD..."+strings.TrimSpace(upstream))
+	if err != nil {
+		return 0, 0, true, err
+	}
+	if _, err := fmt.Sscanf(strings.TrimSpace(counts), "%d %d", &ahead, &behind); err != nil {
+		return 0, 0, true, fmt.Errorf("parse ahead/behind counts %q: %w", strings.TrimSpace(counts), err)
+	}
+	return ahead, behind, true, nil
+}
+
 // WorktreeRemove removes the worktree at path via `git worktree remove`.
 // force allows removal even if the worktree has uncommitted changes.
 func WorktreeRemove(path string, force bool) error {
@@ -253,7 +307,14 @@ func ListWorktrees() ([]WorktreeInfo, error) {
 }
 
 func run(args ...string) (string, error) {
+	return runIn("", args...)
+}
+
+func runIn(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
