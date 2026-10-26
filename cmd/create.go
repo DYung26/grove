@@ -330,32 +330,46 @@ func rollbackCreatedWorktree(repoRoot, name, branch, worktreePath string, newBra
 	}
 
 	backup := worktreePath + ".grove-bak"
-	if _, statErr := os.Stat(backup); statErr == nil {
-		if _, pathErr := os.Lstat(worktreePath); pathErr == nil {
-			if removeErr := os.Remove(worktreePath); removeErr != nil && rollbackErr == nil {
-				rollbackErr = removeErr
+	if rollbackErr == nil {
+		if _, statErr := os.Lstat(backup); statErr == nil {
+			if _, pathErr := os.Lstat(worktreePath); pathErr == nil {
+				if err := os.Remove(worktreePath); err != nil {
+					rollbackErr = fmt.Errorf("remove failed worktree link before restoring backup: %w", err)
+				}
+			} else if !os.IsNotExist(pathErr) {
+				rollbackErr = pathErr
 			}
-		}
-		if rollbackErr == nil {
-			if err := os.Rename(backup, worktreePath); err != nil {
-				rollbackErr = fmt.Errorf("restore original worktree from backup: %w", err)
+			if rollbackErr == nil {
+				if err := os.Rename(backup, worktreePath); err != nil {
+					rollbackErr = fmt.Errorf("restore original worktree from backup: %w", err)
+				}
 			}
+		} else if !os.IsNotExist(statErr) {
+			rollbackErr = statErr
 		}
 	}
 
-	if _, statErr := os.Stat(worktreePath); statErr == nil {
-		if err := git.WorktreeRepair(worktreePath); err != nil && rollbackErr == nil {
-			rollbackErr = fmt.Errorf("repair worktree metadata during rollback: %w", err)
+	if rollbackErr == nil {
+		if _, statErr := os.Lstat(worktreePath); statErr == nil {
+			if err := git.WorktreeRepair(worktreePath); err != nil {
+				rollbackErr = fmt.Errorf("repair worktree metadata during rollback: %w", err)
+			}
+			if rollbackErr == nil {
+				if err := git.WorktreeRemove(worktreePath, true); err != nil {
+					rollbackErr = fmt.Errorf("remove worktree during rollback: %w", err)
+				}
+			}
+		} else if os.IsNotExist(statErr) {
+			if err := git.WorktreePrune(); err != nil {
+				rollbackErr = fmt.Errorf("prune worktree metadata during rollback: %w", err)
+			}
+		} else {
+			rollbackErr = statErr
 		}
-		if err := git.WorktreeRemove(worktreePath, true); err != nil && rollbackErr == nil {
-			rollbackErr = fmt.Errorf("remove worktree during rollback: %w", err)
-		}
-	} else if os.IsNotExist(statErr) {
-		if err := git.WorktreePrune(); err != nil && rollbackErr == nil {
-			rollbackErr = fmt.Errorf("prune worktree metadata during rollback: %w", err)
-		}
-	} else if rollbackErr == nil {
-		rollbackErr = statErr
+	}
+
+	if rollbackErr != nil {
+		return rollbackErr
 	}
 
 	reg, regErr := config.Load(repoRoot)
