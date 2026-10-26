@@ -229,25 +229,62 @@ func migrateIntoSubvolume(subvolume, sibling string) (string, error) {
 	if err := runLocal("btrfs", "subvolume", "create", subvolume); err != nil {
 		return "", err
 	}
-
-	if err := ensureCommand("rsync", "rsync", nil); err != nil {
-		return "", fmt.Errorf("install rsync: %w", err)
+	cleanup := func(cause error) (string, error) {
+		if cleanupErr := removeCreatedSubvolume(subvolume, filepath.Dir(subvolume)); cleanupErr != nil {
+			return "", fmt.Errorf("%w (cleanup of partial pool subvolume %s also failed: %v)", cause, subvolume, cleanupErr)
+		}
+		return "", cause
 	}
 
+	if err := ensureCommand("rsync", "rsync", nil); err != nil {
+		return cleanup(fmt.Errorf("install rsync: %w", err))
+	}
 	if err := runLocalRsync(sibling+"/", subvolume+"/"); err != nil {
-		return "", fmt.Errorf("copy existing %s into pool: %w", sibling, err)
+		return cleanup(fmt.Errorf("copy existing %s into pool: %w", sibling, err))
 	}
 
 	backup := sibling + ".grove-bak"
 	if err := os.Rename(sibling, backup); err != nil {
-		return "", err
+		return cleanup(err)
 	}
 	if err := os.Symlink(subvolume, sibling); err != nil {
-		return "", err
+		if restoreErr := os.Rename(backup, sibling); restoreErr != nil {
+			err = fmt.Errorf("%w (restoring original worktree %s also failed: %v)", err, sibling, restoreErr)
+		}
+		return cleanup(err)
 	}
 
 	fmt.Println(output.Dim(fmt.Sprintf("Migrated existing %s into the pool; original kept at %s (run `grove cleanup` once verified)", output.Path(sibling), output.Path(backup))))
 	return backup, nil
+}
+
+// removeCreatedSubvolume deletes only a subvolume created by the current
+// migration. It verifies the target is inside the pool before deleting it.
+func removeCreatedSubvolume(subvolume, mountPoint string) error {
+	absMount, err := filepath.Abs(mountPoint)
+	if err != nil {
+		return err
+	}
+	absSubvolume, err := filepath.Abs(subvolume)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(absMount, absSubvolume)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("refusing to remove %s outside pool %s", subvolume, mountPoint)
+	}
+	if err := runLocal("btrfs", "subvolume", "delete", absSubvolume); err == nil {
+		return nil
+	}
+	if err := os.RemoveAll(absSubvolume); err != nil {
+		return fmt.Errorf("remove partial subvolume %s: %w", absSubvolume, err)
+	}
+	if _, err := os.Lstat(absSubvolume); err == nil {
+		return fmt.Errorf("partial subvolume %s still exists after cleanup", absSubvolume)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("verify cleanup of partial subvolume %s: %w", absSubvolume, err)
+	}
+	return nil
 }
 
 func runLocal(name string, args ...string) error {
@@ -320,6 +357,24 @@ func DeleteSubvolume(linkPath, mountPoint string) error {
 
 	if err := runLocal("btrfs", "subvolume", "delete", subvolume); err != nil {
 		return fmt.Errorf("delete subvolume %s: %w", subvolume, err)
+	}
+	return os.Remove(linkPath)
+}
+
+// DeleteSubvolumeForRollback removes a newly-created pool subvolume during
+// create rollback. Normal subvolume deletion is intentionally delegated to
+// btrfs, but some Grove pool mounts omit user_subvol_rm_allowed; in that
+// configuration an unprivileged owner can still remove an empty subvolume
+// through rmdir(2). Because a just-created worktree is disposable on a
+// failed create, this fallback clears its contents and removes the now-empty
+// subvolume instead of requiring an interactive sudo password.
+func DeleteSubvolumeForRollback(linkPath, mountPoint string) error {
+	subvolume, err := filepath.EvalSymlinks(linkPath)
+	if err != nil {
+		return fmt.Errorf("resolve %s to its pool subvolume: %w", linkPath, err)
+	}
+	if err := removeCreatedSubvolume(subvolume, mountPoint); err != nil {
+		return fmt.Errorf("delete created pool subvolume: %w", err)
 	}
 	return os.Remove(linkPath)
 }

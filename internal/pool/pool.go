@@ -590,6 +590,14 @@ func Usage(mountPoint string) (usedBytes, totalBytes uint64, err error) {
 	return totalBytes - freeBytes, totalBytes, nil
 }
 
+func AvailableBytes(mountPoint string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(mountPoint, &stat); err != nil {
+		return 0, err
+	}
+	return stat.Bavail * uint64(stat.Bsize), nil
+}
+
 // ErrShrinkTargetTooSmall is returned by Shrink when targetGB doesn't
 // leave enough headroom above the pool's current usage. Checked with
 // Usage's *used* bytes rather than comparing targetGB against current

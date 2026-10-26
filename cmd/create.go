@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -203,22 +205,33 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	rollback := func(cause error) error {
+		if rollbackErr := rollbackCreatedWorktree(repoRoot, name, branch, worktreePath, newBranch); rollbackErr != nil {
+			return fmt.Errorf("%w (rollback also failed: %v)", cause, rollbackErr)
+		}
+		return cause
+	}
+
+	if err := preflightPoolMigration(worktreePath); err != nil {
+		return rollback(err)
+	}
+
 	if err := ensureWorktreePoolResident(repoRoot, name, worktreePath); err != nil {
-		return explainPoolMigrateFailure(err)
+		return rollback(explainPoolMigrateFailure(err))
 	}
 
 	depsSrcRoot, err := resolveDepsSourceRoot(repoRoot, createFrom)
 	if err != nil {
-		return err
+		return rollback(err)
 	}
 
 	depsCloneMode, err := cloneDependencyDirs(repoRoot, depsSrcRoot, worktreePath)
 	if err != nil {
-		return err
+		return rollback(err)
 	}
 
 	if err := recordWorktree(repoRoot, name, branch, worktreePath, depsCloneMode); err != nil {
-		return err
+		return rollback(err)
 	}
 
 	fmt.Println(describeCreated(name, branch, worktreePath))
@@ -226,6 +239,145 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		fmt.Println(describeBranchedFrom(head))
 	}
 	return nil
+}
+
+// preflightPoolMigration checks capacity before rsync copies a newly-created
+// worktree into a Btrfs subvolume. Apparent source size conservatively
+// estimates the destination blocks needed by this full-copy migration.
+func preflightPoolMigration(worktreePath string) error {
+	paths, err := pool.DefaultPaths()
+	if err != nil {
+		return err
+	}
+	mounted, err := pool.IsMounted(paths.MountPoint)
+	if err != nil || !mounted {
+		return err
+	}
+	if fs.DetectCloneSupport(filepath.Dir(worktreePath)) == fs.CloneSupported {
+		return nil
+	}
+	info, err := os.Lstat(worktreePath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	_, total, err := pool.Usage(paths.MountPoint)
+	if err != nil {
+		return fmt.Errorf("check Grove pool usage before migrating worktree: %w", err)
+	}
+	available, err := pool.AvailableBytes(paths.MountPoint)
+	if err != nil {
+		return fmt.Errorf("check Grove pool available space before migrating worktree: %w", err)
+	}
+	want, err := directoryApparentSize(worktreePath)
+	if err != nil {
+		return fmt.Errorf("estimate worktree size before pool migration: %w", err)
+	}
+	return checkPoolMigrationSpace(available, total, want)
+}
+
+func checkPoolMigrationSpace(available, total, required uint64) error {
+	if available == 0 {
+		return fmt.Errorf("Grove pool has no available space; grow it with %s and retry", output.Command("grove pool resize +5"))
+	}
+	reserve := uint64(256 << 20)
+	if scaled := total / 20; scaled < reserve {
+		reserve = scaled
+	}
+	if available < required || available-required < reserve {
+		return fmt.Errorf("not enough free space in the Grove pool to safely migrate this worktree (need about %s; %s free, reserving %s); grow the pool with %s and retry", humanBytes(required), humanBytes(available), humanBytes(reserve), output.Command("grove pool resize +5"))
+	}
+	return nil
+}
+
+func directoryApparentSize(path string) (uint64, error) {
+	out, err := exec.Command("du", "-sb", path).Output()
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("unexpected du output for %s: %q", path, out)
+	}
+	return strconv.ParseUint(fields[0], 10, 64)
+}
+
+func humanBytes(n uint64) string {
+	const gib = uint64(1 << 30)
+	if n >= gib {
+		return fmt.Sprintf("%.1f GiB", float64(n)/float64(gib))
+	}
+	return fmt.Sprintf("%.0f MiB", float64(n)/float64(1<<20))
+}
+
+// rollbackCreatedWorktree removes artifacts from a failed create. It removes
+// a newly-created pool subvolume, restores the original worktree directory
+// from its backup, and then asks Git to clean up its worktree metadata.
+func rollbackCreatedWorktree(repoRoot, name, branch, worktreePath string, newBranch bool) error {
+	var rollbackErr error
+
+	paths, err := pool.DefaultPaths()
+	if err != nil {
+		rollbackErr = err
+	} else if mounted, mountErr := pool.IsMounted(paths.MountPoint); mountErr != nil {
+		rollbackErr = mountErr
+	} else if mounted && isPoolResident(worktreePath, paths.MountPoint) {
+		if err := pool.DeleteSubvolumeForRollback(worktreePath, paths.MountPoint); err != nil {
+			rollbackErr = fmt.Errorf("delete created pool worktree: %w", err)
+		}
+	}
+
+	backup := worktreePath + ".grove-bak"
+	if _, statErr := os.Stat(backup); statErr == nil {
+		if _, pathErr := os.Lstat(worktreePath); pathErr == nil {
+			if removeErr := os.Remove(worktreePath); removeErr != nil && rollbackErr == nil {
+				rollbackErr = removeErr
+			}
+		}
+		if rollbackErr == nil {
+			if err := os.Rename(backup, worktreePath); err != nil {
+				rollbackErr = fmt.Errorf("restore original worktree from backup: %w", err)
+			}
+		}
+	}
+
+	if _, statErr := os.Stat(worktreePath); statErr == nil {
+		if err := git.WorktreeRepair(worktreePath); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("repair worktree metadata during rollback: %w", err)
+		}
+		if err := git.WorktreeRemove(worktreePath, true); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("remove worktree during rollback: %w", err)
+		}
+	} else if os.IsNotExist(statErr) {
+		if err := git.WorktreePrune(); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("prune worktree metadata during rollback: %w", err)
+		}
+	} else if rollbackErr == nil {
+		rollbackErr = statErr
+	}
+
+	reg, regErr := config.Load(repoRoot)
+	if regErr == nil {
+		removedWorktree := reg.Remove(name)
+		removedBackup := reg.RemoveBackup(backup)
+		if removedWorktree || removedBackup {
+			if saveErr := reg.Save(repoRoot); saveErr != nil && rollbackErr == nil {
+				rollbackErr = fmt.Errorf("remove rollback metadata: %w", saveErr)
+			}
+		}
+	} else if rollbackErr == nil {
+		rollbackErr = regErr
+	}
+
+	if newBranch {
+		if err := git.BranchDeleteForce(branch); err != nil && rollbackErr == nil {
+			rollbackErr = fmt.Errorf("delete newly-created branch %q during rollback: %w", branch, err)
+		}
+	}
+
+	return rollbackErr
 }
 
 // describeCreated reports the worktree's name, branch, and path,
