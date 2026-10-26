@@ -50,7 +50,10 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	if status := fs.CheckHealth(wt.Path); status != fs.Healthy {
-		return removeUnhealthyWorktree(repoRoot, reg, wt, status)
+		if err := removeUnhealthyWorktree(repoRoot, reg, wt, status); err != nil {
+			return err
+		}
+		return removeBranchIfWanted(wt.Branch)
 	}
 
 	resolvedPath := resolveWorktreeRemovePath(wt.Path)

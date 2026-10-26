@@ -56,10 +56,8 @@ func runPrune(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// removeStaleWorktree picks WorktreeRemove vs WorktreePrune based
-		// on whether the worktree still has a live git record to remove
-		// or is already gone from `git worktree list` and only needs its
-		// dangling administrative state cleared.
+		// The worktree directory is already gone, so only stale Git
+		// administrative metadata and the Grove registry entry are removed.
 		if err := removeStaleWorktree(wt); err != nil {
 			return fmt.Errorf("prune %s: %w", wt.Name, err)
 		}
