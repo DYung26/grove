@@ -2,6 +2,8 @@ module github.com/dyung/grove
 
 go 1.22
 
+godebug multipathtcp=0
+
 require (
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/sys v0.22.0
