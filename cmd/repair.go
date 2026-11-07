@@ -265,7 +265,9 @@ func recordBackupIfAny(repoRoot, path, source string) error {
 	if err != nil {
 		return err
 	}
-	reg.AddBackup(path, source)
+	if err := reg.AddBackup(path, source); err != nil {
+		return fmt.Errorf("resolve backup path %q: %w", path, err)
+	}
 	return reg.Save(repoRoot)
 }
 

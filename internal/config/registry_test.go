@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -105,5 +107,29 @@ func TestRegistryRemoveDropsEntryByName(t *testing.T) {
 
 	if reg.Remove("a") {
 		t.Errorf("Remove(%q): expected false for an already-removed name", "a")
+	}
+}
+
+func TestRegistryAddBackupStoresAbsolutePath(t *testing.T) {
+	workingDir := t.TempDir()
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workingDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+
+	reg := &Registry{}
+	if err := reg.AddBackup(".venv.grove-bak", "repair"); err != nil {
+		t.Fatalf("AddBackup: %v", err)
+	}
+	if got, want := reg.Backups[0].Path, filepath.Join(workingDir, ".venv.grove-bak"); got != want {
+		t.Fatalf("backup path = %q, want %q", got, want)
 	}
 }

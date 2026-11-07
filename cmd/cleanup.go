@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,13 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
+		path, err := resolveBackupPath(repoRoot, reg, b)
+		if err != nil {
+			fmt.Println(output.Warn(fmt.Sprintf("  cannot resolve %s: %s (retained in registry)", output.Path(b.Path), err)))
+			kept++
+			continue
+		}
+		b.Path = path
 		fmt.Println(describeBackup(b))
 
 		remove := cleanupYes
@@ -79,13 +87,13 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		if err := os.RemoveAll(b.Path); err != nil {
-			fmt.Println(output.Warn(fmt.Sprintf("  failed to delete %s: %s (left in registry so it isn't lost track of)", output.Path(b.Path), err)))
+		if err := removeBackup(b.Path); err != nil {
+			fmt.Println(output.Warn(fmt.Sprintf("  failed to delete %s: %s (retained in registry)", output.Path(b.Path), err)))
 			kept++
 			continue
 		}
 
-		reg.RemoveBackup(b.Path)
+		reg.RemoveBackup(backups[i].Path)
 		deleted++
 		fmt.Println(output.Success("  ✓ deleted"))
 	}
@@ -95,6 +103,67 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n%s Deleted %d, kept %d.\n", output.Success("✓"), deleted, kept)
+	return nil
+}
+
+func resolveBackupPath(repoRoot string, reg *config.Registry, backup config.BackupEntry) (string, error) {
+	if backup.Path == "" || !strings.HasSuffix(filepath.Base(backup.Path), ".grove-bak") {
+		return "", fmt.Errorf("invalid backup path")
+	}
+
+	if filepath.IsAbs(backup.Path) {
+		path := filepath.Clean(backup.Path)
+		if _, err := os.Lstat(path); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+
+	if !filepath.IsLocal(backup.Path) {
+		return "", fmt.Errorf("relative path escapes its owning directory")
+	}
+
+	roots := []string{repoRoot}
+	for _, worktree := range reg.Worktrees {
+		if worktree.Path != "" {
+			roots = append(roots, worktree.Path)
+		}
+	}
+
+	matches := make(map[string]struct{})
+	for _, root := range roots {
+		path := filepath.Clean(filepath.Join(root, backup.Path))
+		if _, err := os.Lstat(path); err == nil {
+			matches[path] = struct{}{}
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no matching backup found under the repository or its tracked worktrees")
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("matches multiple tracked locations")
+	}
+	for path := range matches {
+		return path, nil
+	}
+	return "", fmt.Errorf("backup path could not be resolved")
+}
+
+func removeBackup(path string) error {
+	if _, err := os.Lstat(path); err != nil {
+		return fmt.Errorf("backup does not exist: %w", err)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("path still exists after removal")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	return nil
 }
 

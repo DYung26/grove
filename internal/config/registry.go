@@ -62,15 +62,21 @@ type Registry struct {
 	Backups   []BackupEntry `json:"backups,omitempty"`
 }
 
-// AddBackup records a newly created backup. Callers are expected to have
-// already performed the actual os.Rename; this only updates bookkeeping,
-// and does not itself Save the registry.
-func (r *Registry) AddBackup(path, source string) {
+// AddBackup records a newly created backup with an absolute path. Callers
+// are expected to have already performed the actual os.Rename; this only
+// updates bookkeeping and does not itself Save the registry.
+func (r *Registry) AddBackup(path, source string) error {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+
 	r.Backups = append(r.Backups, BackupEntry{
-		Path:      path,
+		Path:      filepath.Clean(absolutePath),
 		CreatedAt: time.Now(),
 		Source:    source,
 	})
+	return nil
 }
 
 // RemoveBackup drops the tracked backup at the given path, if present.
