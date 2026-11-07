@@ -72,6 +72,9 @@ func runRepair(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	if err := ensureWorktreePoolResident(repoRoot, name, wt.Path); err != nil {
 		return explainPoolMigrateFailure(err)
 	}
@@ -81,6 +84,9 @@ func runRepair(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	depsCloneMode, repaired, err := repairDependencyDirs(repoRoot, depsSrcRoot, wt.Path)
 	if err != nil {
 		return err

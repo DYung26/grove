@@ -75,6 +75,14 @@ Both `grove create` and `grove repair` also take:
 - `--from <worktree-or-path>` — clone dependency dirs from a different worktree instead of the main repo. Useful when a sibling worktree already has richer state than the main repo does, or one that was adopted with a plain (non-reflinked) copy of its own. If that worktree isn't already pool-resident, Grove migrates its dependency dirs into the pool first (same as `grove pool init` does for the main repo) so the clone can actually reflink instead of silently falling back to hardlink/copy.
 - `grove create` additionally takes `--no-deps` to skip dependency cloning entirely.
 
+## Storage protection
+
+Every Grove command checks the free capacity of the pool and the filesystem backing `~/.grove/pool.img`, including available bytes and inodes. Commands warn at 85% usage. At 90%, storage-intensive operations such as creating or repairing worktrees and migrating/resizing the pool are blocked. At 95%, all ordinary mutations are blocked. The effective usage is the higher of block and inode utilization, so inode exhaustion is handled before file creation starts failing.
+
+The thresholds can be overridden with `GROVE_STORAGE_WARN_PERCENT`, `GROVE_STORAGE_BLOCK_PERCENT`, and `GROVE_STORAGE_CRITICAL_PERCENT`. Values must be integers from 1 to 100 and satisfy `WARN < BLOCK < CRITICAL`. Defaults are 85, 90, and 95 respectively.
+
+Mutating commands are serialized with an OS file lock so concurrent Grove processes cannot independently pass the same capacity check. Capacity is checked again before long-running worktree migrations, dependency repairs, and pool resize operations. A read-only pool blocks operations that would write to it; `grove pool repair` remains available to recover it. Read-only diagnostics and emergency cleanup/recovery commands remain available when capacity thresholds are reached. ENOSPC and EROFS failures are reported with recovery guidance; use `grove pool status`, `grove clean`, `grove cleanup`, or `grove pool repair` as appropriate.
+
 ## Configuring dependency dirs
 
 Grove already knows the common cases — `node_modules` for npm, `target` for Cargo, `.venv` for Python, nothing extra for pnpm (its `node_modules` is mostly symlinks into a shared store already, so cloning it wins nothing). For anything else, drop a `.grove.json` in the repo root:

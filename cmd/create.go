@@ -225,6 +225,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return rollback(err)
 	}
 
+	if err := recheckStorageCapacity(); err != nil {
+		return rollback(err)
+	}
 	depsCloneMode, err := cloneDependencyDirs(repoRoot, depsSrcRoot, worktreePath)
 	if err != nil {
 		return rollback(err)
@@ -245,6 +248,9 @@ func runCreate(cmd *cobra.Command, args []string) error {
 // worktree into a Btrfs subvolume. Apparent source size conservatively
 // estimates the destination blocks needed by this full-copy migration.
 func preflightPoolMigration(worktreePath string) error {
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	paths, err := pool.DefaultPaths()
 	if err != nil {
 		return err

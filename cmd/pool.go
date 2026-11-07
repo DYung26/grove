@@ -64,6 +64,9 @@ func init() {
 }
 
 func runPoolInit(cmd *cobra.Command, args []string) error {
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	paths, err := pool.DefaultPaths()
 	if err != nil {
 		return err
@@ -169,6 +172,9 @@ func migrateMainDependencyDirsIntoPool(paths pool.Paths) error {
 
 	repoName := filepath.Base(repoRoot)
 	for _, dir := range dirs {
+		if err := recheckStorageCapacity(); err != nil {
+			return err
+		}
 		if _, err := os.Stat(filepath.Join(repoRoot, dir)); os.IsNotExist(err) {
 			continue
 		}
@@ -191,6 +197,9 @@ func migrateMainDependencyDirsIntoPool(paths pool.Paths) error {
 // Worktree paths recorded in the registry don't change — only what's on
 // disk at <repo>.wt/<name> does — so no registry update is needed here.
 func runPoolMigrate(cmd *cobra.Command, args []string) error {
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	repoRoot, err := git.MainRepoRoot()
 	if err != nil {
 		return err
@@ -214,6 +223,9 @@ func runPoolMigrate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("pool isn't mounted (run %s first)", output.Command("grove pool init"))
 	}
 
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	migrated, backup, err := pool.SplitRepoVolume(paths.MountPoint, repoRoot, trackedWorktreeNames(reg))
 	if err != nil {
 		return err
@@ -384,6 +396,22 @@ func runPoolResize(cmd *cobra.Command, args []string) error {
 // same reasoning `grove pool init`'s own size fallback already relies
 // on.
 func runPoolGrow(paths pool.Paths, action resizeAction) error {
+	if err := recheckBackingCapacity(); err != nil {
+		return err
+	}
+	mounted, err := pool.IsMounted(paths.MountPoint)
+	if err != nil {
+		return err
+	}
+	if mounted {
+		readOnly, err := pool.IsReadOnly(paths.MountPoint)
+		if err != nil {
+			return err
+		}
+		if readOnly {
+			return fmt.Errorf("pool is read-only; run grove pool repair before resizing")
+		}
+	}
 	fmt.Printf("Growing pool by %dG...\n", action.gb)
 	if err := pool.Resize(paths, action.gb); err != nil {
 		return err
@@ -428,6 +456,9 @@ func runPoolShrink(paths pool.Paths, action resizeAction) error {
 		return nil
 	}
 
+	if err := recheckStorageCapacity(); err != nil {
+		return err
+	}
 	fmt.Printf("Shrinking pool to %dG...\n", targetGB)
 	if err := pool.Shrink(paths, targetGB); err != nil {
 		return err
