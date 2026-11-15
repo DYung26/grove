@@ -59,6 +59,7 @@ grove remove feature-x        # done with it — clean it up
 | `grove prune` | Reconciles stale Grove registry entries with Git when the worktree directory has already disappeared, removing the registry entry and any stale Git worktree metadata. It never deletes a worktree directory; use `grove clean` to review extant or orphaned worktrees. `--dry-run` previews the entries that would be reconciled without changing anything. This is not the command for choosing worktrees you no longer want; use `grove clean` for that. |
 | `grove adopt <path>` | Starts tracking a worktree that already exists but that Grove didn't create — an old manual checkout, or one from before you started using Grove. Registry-only; doesn't touch dependency dirs. |
 | `grove repair <name>` (alias `sync-deps`) | Retrofits CoW onto an already-tracked worktree: migrates the worktree's own directory into the pool first if it's still on a plain, non-reflinkable filesystem (the case for anything created before the pool existed, or adopted from a pre-Grove layout), then retrofits its dependency dirs the same way `adopt` leaves them or a fallback previously did. |
+| `grove share [name]` | Links local-only files from the main repo into one tracked worktree or all tracked worktrees. Existing copies are kept by default; linking over one requires confirmation and preserves the old copy as `.grove-bak`. |
 | `grove status` (alias `doctor`) | Reports drift: tracked worktrees whose deps aren't fully reflinked (repair candidates), and git worktrees on disk that Grove isn't tracking at all (adopt candidates). Doesn't fix anything itself — just tells you what needs attention. |
 | `grove savings` (alias `du`) | Shows how much disk space CoW is actually saving: each tracked worktree's dependency-dir size on disk vs. what it would be without CoW, which clone mode (reflink/hardlink/copy/n/a) it's using, and a total across every worktree. |
 | `grove pool init` | Sets up the Btrfs loopback pool used for CoW on filesystems without native reflink support, and moves the current repo's own dependency dirs into it (symlinked back into place) so they become a valid reflink source. Idempotent, safe to re-run. `--size` sets the size in GiB. |
@@ -68,7 +69,7 @@ grove remove feature-x        # done with it — clean it up
 
 Run `grove install-completions` to install completions for the shell named by `$SHELL` (Bash is the fallback on Unix; PowerShell is the fallback on Windows). Or choose one explicitly with `grove install-completions zsh`, `grove install-completions fish`, and so on. Existing completion files are not overwritten unless `--force` is passed. `grove completion <shell>` remains available to print the generated script without installing it.
 
-The generated completion supports Grove commands, subcommands, flags and the following dynamic values: local Git branches for `grove create`; tracked Grove worktree names for `grove remove`, `grove clean`, `grove repair` and the first argument of `grove rename`; and both tracked names and local branch names for `grove open`. Completion values are discovered at tab-completion time from the current repository, not cached in the script. Remote-only branches are not included unless they also exist as local branches. File installation and shell activation are distinct: Grove reports any shell-specific setup still required (for example, enabling Zsh `compinit` or sourcing the PowerShell script in your profile).
+The generated completion supports Grove commands, subcommands, flags and the following dynamic values: local Git branches for `grove create`; tracked Grove worktree names for `grove remove`, `grove clean`, `grove repair`, `grove share` and the first argument of `grove rename`; and both tracked names and local branch names for `grove open`. Completion values are discovered at tab-completion time from the current repository, not cached in the script. Remote-only branches are not included unless they also exist as local branches. File installation and shell activation are distinct: Grove reports any shell-specific setup still required (for example, enabling Zsh `compinit` or sourcing the PowerShell script in your profile).
 
 Both `grove create` and `grove repair` also take:
 
@@ -90,11 +91,13 @@ Grove already knows the common cases — `node_modules` for npm, `target` for Ca
 ```json
 {
   "dependency_dirs": ["vendor"],
-  "exclude_dependency_dirs": ["target"]
+  "exclude_dependency_dirs": ["target"],
+  "shared_paths": ["config/local.json"],
+  "exclude_shared_paths": [".env.test"]
 }
 ```
 
-`dependency_dirs` adds to the built-in set for your project type; `exclude_dependency_dirs` removes entries even if Grove would normally include them. Commit this file — it describes the project, not your local machine.
+`dependency_dirs` adds to the built-in set for your project type; `exclude_dependency_dirs` removes entries even if Grove would normally include them. `shared_paths` adds paths to the local-only files Grove links from the main repo into new worktrees; `exclude_shared_paths` removes paths from the defaults and configured list. By default, Grove shares untracked `.env`, `.env.*`, and `.envrc` files throughout the repo (excluding common example/template files and generated/dependency directories), plus `docs/_local/`. These paths are symlinks, not reflinks, so edits are visible from every worktree. Run `grove share` to reconcile existing worktrees. Commit this file — it describes the project, not your local machine.
 
 ## Why "Grove"
 

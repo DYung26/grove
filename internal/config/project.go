@@ -8,15 +8,14 @@ import (
 	"sort"
 )
 
-// ProjectConfig is optional, per-repo, hand-authored settings meant to be
-// committed to the repo (unlike Registry, which is local runtime state).
-// It extends Grove's built-in dependency-dir detection rather than
-// replacing it: DependencyDirs adds to the built-in set, and
-// ExcludeDependencyDirs removes entries even if Grove would otherwise
-// detect them.
+// ProjectConfig contains optional, hand-authored settings committed with
+// the repo. It configures dependency directories and local-only paths
+// shared between worktrees.
 type ProjectConfig struct {
 	DependencyDirs        []string `json:"dependency_dirs,omitempty"`
 	ExcludeDependencyDirs []string `json:"exclude_dependency_dirs,omitempty"`
+	SharedPaths           []string `json:"shared_paths,omitempty"`
+	ExcludeSharedPaths    []string `json:"exclude_shared_paths,omitempty"`
 }
 
 func LoadProjectConfig(repoRoot string) (ProjectConfig, error) {

@@ -233,6 +233,10 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return rollback(err)
 	}
 
+	if err := shareNewWorktree(repoRoot, worktreePath); err != nil {
+		return rollback(err)
+	}
+
 	if err := recordWorktree(repoRoot, name, branch, worktreePath, depsCloneMode); err != nil {
 		return rollback(err)
 	}
