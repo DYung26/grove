@@ -65,8 +65,12 @@ func init() {
 }
 
 func runPoolInit(cmd *cobra.Command, args []string) error {
-	if repoRoot, err := git.MainRepoRoot(); err == nil && repoHasNativeReflink(repoRoot, fs.DetectCloneSupport) {
-		fmt.Printf("Native reflink support detected on %s; the Grove Btrfs pool is unnecessary. Skipping pool initialization.\n", filepath.Dir(repoRoot))
+	probeDir, _, err := nativeReflinkProbeDirectory()
+	if err != nil {
+		return err
+	}
+	if directoryHasNativeReflink(probeDir, fs.DetectCloneSupport) {
+		fmt.Printf("Native reflink support detected on %s; the Grove Btrfs pool is unnecessary. Skipping pool initialization.\n", probeDir)
 		return nil
 	}
 
@@ -582,8 +586,16 @@ func runPoolStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if !mounted {
-		if repoRoot, repoErr := git.MainRepoRoot(); repoErr == nil && repoHasNativeReflink(repoRoot, fs.DetectCloneSupport) {
-			fmt.Println(output.Dim("Pool not mounted; this repo's filesystem supports native reflinks, so no pool is needed here."))
+		probeDir, isRepo, err := nativeReflinkProbeDirectory()
+		if err != nil {
+			return err
+		}
+		if directoryHasNativeReflink(probeDir, fs.DetectCloneSupport) {
+			context := "the current filesystem"
+			if isRepo {
+				context = "this repo's filesystem"
+			}
+			fmt.Println(output.Dim(fmt.Sprintf("Pool not mounted; %s supports native reflinks, so no pool is needed here.", context)))
 			return nil
 		}
 		fmt.Println(output.Warn("pool not mounted") + " (run " + output.Command("grove pool init") + ")")
@@ -747,11 +759,30 @@ func expectedSubvolumeNames(repoRoot, repoName string, reg *config.Registry) map
 	return expected
 }
 
-// repoHasNativeReflink reports whether worktrees created beside repoRoot
-// can use the host filesystem's native copy-on-write cloning. In that
-// case a loopback Btrfs pool adds no value and should not be initialized.
-// The detector is injected so this policy can be tested without requiring
-// a particular filesystem in the test environment.
-func repoHasNativeReflink(repoRoot string, detect func(string) fs.CloneSupport) bool {
-	return detect(filepath.Dir(repoRoot)) == fs.CloneSupported
+// nativeReflinkProbeDirectory selects the filesystem where Grove will
+// place worktrees, or the current directory when run outside a repository.
+func nativeReflinkProbeDirectory() (string, bool, error) {
+	repoRoot, err := git.MainRepoRoot()
+	if err == nil {
+		return nativeReflinkProbeDir(repoRoot, ""), true, nil
+	}
+	if !errors.Is(err, git.ErrNotAGitRepo) {
+		return "", false, err
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		return "", false, err
+	}
+	return nativeReflinkProbeDir(repoRoot, workingDirectory), repoRoot != "", nil
+}
+
+func nativeReflinkProbeDir(repoRoot, workingDirectory string) string {
+	if repoRoot != "" {
+		return filepath.Dir(repoRoot)
+	}
+	return workingDirectory
+}
+
+func directoryHasNativeReflink(directory string, detect func(string) fs.CloneSupport) bool {
+	return detect(directory) == fs.CloneSupported
 }

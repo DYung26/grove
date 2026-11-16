@@ -7,28 +7,34 @@ import (
 	"github.com/dyung/grove/internal/fs"
 )
 
-func TestRepoHasNativeReflink(t *testing.T) {
+func TestNativeReflinkProbeDirectory(t *testing.T) {
 	repoRoot := filepath.Join(t.TempDir(), "project")
-	var detectedPath string
+	workingDirectory := filepath.Join(t.TempDir(), "home")
 
-	if !repoHasNativeReflink(repoRoot, func(path string) fs.CloneSupport {
-		detectedPath = path
-		return fs.CloneSupported
-	}) {
-		t.Fatal("repo with native reflink support should skip pool initialization")
+	if got := nativeReflinkProbeDir(repoRoot, workingDirectory); got != filepath.Dir(repoRoot) {
+		t.Fatalf("repo probe directory = %q, want %q", got, filepath.Dir(repoRoot))
 	}
-	if detectedPath != filepath.Dir(repoRoot) {
-		t.Fatalf("detected filesystem at %q, want worktree parent %q", detectedPath, filepath.Dir(repoRoot))
+	if got := nativeReflinkProbeDir("", workingDirectory); got != workingDirectory {
+		t.Fatalf("outside-repo probe directory = %q, want %q", got, workingDirectory)
 	}
+}
 
-	if repoHasNativeReflink(repoRoot, func(string) fs.CloneSupport {
-		return fs.CloneUnsupported
-	}) {
-		t.Fatal("repo without native reflink support should still be eligible for pool initialization")
-	}
-	if repoHasNativeReflink(repoRoot, func(string) fs.CloneSupport {
-		return fs.CloneUnknown
-	}) {
-		t.Fatal("unknown filesystem support must not be treated as native reflink support")
+func TestDirectoryHasNativeReflink(t *testing.T) {
+	for _, support := range []struct {
+		name    string
+		support fs.CloneSupport
+		want    bool
+	}{
+		{name: "supported", support: fs.CloneSupported, want: true},
+		{name: "unsupported", support: fs.CloneUnsupported, want: false},
+		{name: "unknown", support: fs.CloneUnknown, want: false},
+	} {
+		t.Run(support.name, func(t *testing.T) {
+			if got := directoryHasNativeReflink("/tmp", func(string) fs.CloneSupport {
+				return support.support
+			}); got != support.want {
+				t.Fatalf("directoryHasNativeReflink() = %t, want %t", got, support.want)
+			}
+		})
 	}
 }
