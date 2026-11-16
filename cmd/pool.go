@@ -15,6 +15,7 @@ import (
 	"github.com/dyung/grove/internal/output"
 	"github.com/dyung/grove/internal/pool"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var poolInitSizeGB uint64
@@ -51,10 +52,11 @@ var poolRepairCmd = &cobra.Command{
 }
 
 var poolResizeCmd = &cobra.Command{
-	Use:   "resize <+N | -N | N>",
-	Short: "Resize the pool: grow by N GiB (+N), shrink by N GiB (-N), or resize to N GiB total (N)",
-	Args:  exactArgs(1),
-	RunE:  runPoolResize,
+	Use:                "resize <+N | -N | N>",
+	Short:              "Resize the pool: grow by N GiB (+N), shrink by N GiB (-N), or resize to N GiB total (N)",
+	Args:               poolResizeArgs,
+	DisableFlagParsing: true,
+	RunE:               runPoolResize,
 }
 
 func init() {
@@ -62,6 +64,13 @@ func init() {
 	poolRepairCmd.Flags().BoolVar(&poolRepairForce, "force", false, "skip confirmation before recreating the pool")
 	poolCmd.AddCommand(poolInitCmd, poolStatusCmd, poolMigrateCmd, poolRepairCmd, poolResizeCmd)
 	rootCmd.AddCommand(poolCmd)
+}
+
+func poolResizeArgs(cmd *cobra.Command, args []string) error {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		return pflag.ErrHelp
+	}
+	return exactArgs(1)(cmd, args)
 }
 
 func runPoolInit(cmd *cobra.Command, args []string) error {
