@@ -62,7 +62,7 @@ grove remove feature-x        # done with it — clean it up
 | `grove share [name]` | Links local-only files from the main repo into one tracked worktree or all tracked worktrees. Existing copies are kept by default; linking over one requires confirmation and preserves the old copy as `.grove-bak`. |
 | `grove status` (alias `doctor`) | Reports drift: tracked worktrees whose deps aren't fully reflinked (repair candidates), and git worktrees on disk that Grove isn't tracking at all (adopt candidates). Doesn't fix anything itself — just tells you what needs attention. |
 | `grove savings` (alias `du`) | Shows how much disk space CoW is actually saving: each tracked worktree's dependency-dir size on disk vs. what it would be without CoW, which clone mode (reflink/hardlink/copy/n/a) it's using, and a total across every worktree. |
-| `grove pool init` | Sets up the Btrfs loopback pool used for CoW on filesystems without native reflink support, and moves the current repo's own dependency dirs into it (symlinked back into place) so they become a valid reflink source. Idempotent, safe to re-run. `--size` sets the size in GiB. |
+| `grove pool init` | Sets up the Btrfs loopback pool on filesystems without native reflink support, and moves the current repo's own dependency dirs into it (symlinked back into place) so they become a valid reflink source. When run inside a repo whose worktree filesystem already supports reflinks (such as Btrfs), it reports that the pool is unnecessary and skips setup/migration. `--size` sets the size in GiB. |
 | `grove pool status` | Shows whether the pool is currently mounted. |
 
 ### Shell completions

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/dyung/grove/internal/config"
+	"github.com/dyung/grove/internal/fs"
 	"github.com/dyung/grove/internal/git"
 	"github.com/dyung/grove/internal/output"
 	"github.com/dyung/grove/internal/pool"
@@ -25,7 +26,7 @@ var poolCmd = &cobra.Command{
 
 var poolInitCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Create and mount the Btrfs loopback pool, and move the current repo's dependency dirs into it",
+	Short: "Set up the fallback Btrfs pool when the current repo filesystem lacks native reflink support",
 	RunE:  runPoolInit,
 }
 
@@ -64,6 +65,11 @@ func init() {
 }
 
 func runPoolInit(cmd *cobra.Command, args []string) error {
+	if repoRoot, err := git.MainRepoRoot(); err == nil && repoHasNativeReflink(repoRoot, fs.DetectCloneSupport) {
+		fmt.Printf("Native reflink support detected on %s; the Grove Btrfs pool is unnecessary. Skipping pool initialization.\n", filepath.Dir(repoRoot))
+		return nil
+	}
+
 	if err := recheckStorageCapacity(); err != nil {
 		return err
 	}
@@ -576,6 +582,10 @@ func runPoolStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if !mounted {
+		if repoRoot, repoErr := git.MainRepoRoot(); repoErr == nil && repoHasNativeReflink(repoRoot, fs.DetectCloneSupport) {
+			fmt.Println(output.Dim("Pool not mounted; this repo's filesystem supports native reflinks, so no pool is needed here."))
+			return nil
+		}
 		fmt.Println(output.Warn("pool not mounted") + " (run " + output.Command("grove pool init") + ")")
 		return nil
 	}
@@ -735,4 +745,13 @@ func expectedSubvolumeNames(repoRoot, repoName string, reg *config.Registry) map
 		}
 	}
 	return expected
+}
+
+// repoHasNativeReflink reports whether worktrees created beside repoRoot
+// can use the host filesystem's native copy-on-write cloning. In that
+// case a loopback Btrfs pool adds no value and should not be initialized.
+// The detector is injected so this policy can be tested without requiring
+// a particular filesystem in the test environment.
+func repoHasNativeReflink(repoRoot string, detect func(string) fs.CloneSupport) bool {
+	return detect(filepath.Dir(repoRoot)) == fs.CloneSupported
 }
