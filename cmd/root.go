@@ -142,9 +142,6 @@ func recheckBackingCapacity() error {
 	if err != nil {
 		return err
 	}
-	for _, warning := range report.Warnings() {
-		fmt.Fprintln(os.Stderr, "Warning:", warning)
-	}
 	return report.ErrorForMutation(true, false, false)
 }
 
@@ -160,9 +157,6 @@ func recheckStorageCapacity() error {
 	report, err := storage.Inspect(filepath.Dir(paths.Image), paths.MountPoint, mounted)
 	if err != nil {
 		return err
-	}
-	for _, warning := range report.Warnings() {
-		fmt.Fprintln(os.Stderr, "Warning:", warning)
 	}
 	return report.ErrorForMutation(true, false, false)
 }

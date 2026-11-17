@@ -214,15 +214,30 @@ func (r Report) ErrorForMutation(storageIntensive, recovery, allowReadOnlyPool b
 }
 
 func (r Report) Warnings() []string {
-	var warnings []string
-	capacities := []Capacity{r.Backing}
-	if r.Pool != nil {
-		capacities = append(capacities, *r.Pool)
+	type monitoredFilesystem struct {
+		capacity Capacity
+		name     string
+		guidance string
 	}
-	for _, capacity := range capacities {
-		usage := capacity.FullPercent()
+
+	filesystems := []monitoredFilesystem{{
+		capacity: r.Backing,
+		name:     "backing filesystem",
+		guidance: "Free space on the backing filesystem; growing the pool also consumes this space",
+	}}
+	if r.Pool != nil {
+		filesystems = append(filesystems, monitoredFilesystem{
+			capacity: *r.Pool,
+			name:     "pool filesystem",
+			guidance: "Free pool space with `grove clean` / `grove cleanup`, or grow it with `grove pool resize +N` if the backing filesystem has enough free space",
+		})
+	}
+
+	var warnings []string
+	for _, filesystem := range filesystems {
+		usage := filesystem.capacity.FullPercent()
 		if usage >= float64(r.WarnPercent) {
-			warnings = append(warnings, fmt.Sprintf("storage warning at %.1f%% (warning threshold %d%%): %s. Free space with `grove clean` / `grove cleanup`, or grow the pool with `grove pool resize +N`", usage, r.WarnPercent, capacity.String()))
+			warnings = append(warnings, fmt.Sprintf("storage warning on %s at %.1f%% (warning threshold %d%%): %s. %s", filesystem.name, usage, r.WarnPercent, filesystem.capacity.String(), filesystem.guidance))
 		}
 	}
 	return warnings
