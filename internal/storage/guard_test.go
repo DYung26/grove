@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -24,6 +25,28 @@ func TestThresholdsAndBoundaries(t *testing.T) {
 	report.Backing.UsedPercent = 95
 	if err := report.ErrorForMutation(false, false, false); err == nil {
 		t.Fatal("expected all mutations blocked at 95%")
+	}
+}
+
+func TestWarningsDistinguishBackingAndPoolFilesystems(t *testing.T) {
+	pool := Capacity{Path: "/pool-mount", UsedPercent: 91, FreeBytes: 1024}
+	report := Report{
+		Backing:         Capacity{Path: "/.grove", UsedPercent: 88, FreeBytes: 2048},
+		Pool:            &pool,
+		WarnPercent:     85,
+		BlockPercent:    90,
+		CriticalPercent: 95,
+	}
+
+	warnings := report.Warnings()
+	if len(warnings) != 2 {
+		t.Fatalf("expected separate backing and pool warnings, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "backing filesystem") || !strings.Contains(warnings[0], "growing the pool also consumes this space") {
+		t.Fatalf("backing warning lacks host-capacity guidance: %s", warnings[0])
+	}
+	if !strings.Contains(warnings[1], "pool filesystem") || !strings.Contains(warnings[1], "grove clean") || !strings.Contains(warnings[1], "backing filesystem has enough free space") {
+		t.Fatalf("pool warning lacks pool-specific guidance: %s", warnings[1])
 	}
 }
 
